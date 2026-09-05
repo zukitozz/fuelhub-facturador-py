@@ -48,9 +48,10 @@ def detectar_desfase_bd(conn) -> float:
     nada acá. Se redondea a media hora porque ninguna zona horaria usa una
     granularidad menor, y así un par de segundos de latencia no ensucian el valor.
     """
-    # Import diferido: evita el ciclo main <-> utilidades (main importa este módulo
-    # al cargar) y, de paso, hace que un test que reemplace main._bd siga viéndose
-    # acá — se resuelve a través de main.py, no de una copia importada al cargar.
+    # Import diferido: evita el ciclo main <-> utilidades_timer (main importa este
+    # módulo al cargar) y, de paso, hace que un test que reemplace main._bd siga
+    # viéndose acá — se resuelve a través de main.py, no de una copia importada al
+    # cargar.
     import main
 
     global _desfase_horas

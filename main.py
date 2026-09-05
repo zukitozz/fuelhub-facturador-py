@@ -37,7 +37,8 @@ from dominio.cdr import (
     _TIPO_RC, _texto_de_nodo, _extraer_numeracion, _reconciliar_numeracion,
     _datos_del_nombre_cdr, parsear_xml_cdr,
 )
-from utilidades import detectar_desfase_bd, fecha_local
+from utilidades_timer import detectar_desfase_bd, fecha_local
+from utilidades_files import escribir_archivo, _borrar_si_existe, _mover, _archivo_estable
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -353,33 +354,9 @@ _notificador_comprobantes = integraciones.elegir(NOTIFICADOR_COMPROBANTES)
 # ---------------------------------------------------------------------------
 
 
-def escribir_archivo(ruta: str, contenido: str):
-    tmp = ruta + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as fh:
-        fh.write(contenido)
-    os.replace(tmp, ruta)
-
-
-def _borrar_si_existe(ruta: str):
-    """
-    Borra un archivo que puede no estar. Se usa al regenerar un comprobante: el SFS
-    levanta todo lo que encuentre en DATA, así que un archivo sobrante de una
-    emisión anterior se colaría en la nueva.
-    """
-    try:
-        os.remove(ruta)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        logger.exception("No se pudo borrar %s", ruta)
-
-
-def _mover(ruta: str, carpeta: str):
-    os.makedirs(carpeta, exist_ok=True)
-    try:
-        os.replace(ruta, os.path.join(carpeta, os.path.basename(ruta)))
-    except Exception:
-        logger.exception("No se pudo mover %s a %s", ruta, carpeta)
+# escribir_archivo, _borrar_si_existe, _mover y _archivo_estable viven en
+# utilidades_files.py — lectura/escritura de archivos genérica, importada al
+# principio del archivo.
 
 # ---------------------------------------------------------------------------
 # Base de datos — PostgreSQL de la aplicación
@@ -2125,25 +2102,6 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
     filas = _escribir_bd(_bd().guardar_error, conn, numeracion,
                          detalle[:_MAX_ERRORS_SQL])
     return filas > 0
-
-
-def _archivo_estable(ruta: str, intentos: int = 5, espera: float = 0.5) -> bool:
-    """
-    True cuando el tamaño del archivo dejó de cambiar. SUNAT/SFS deja el ZIP en RPTA
-    mientras todavía lo escribe y watchdog avisa apenas se crea: abrirlo de inmediato
-    daba BadZipFile —y lo mandaba a errores/— sobre un archivo que estaba sano.
-    """
-    ultimo = -1
-    for _ in range(intentos):
-        try:
-            actual = os.path.getsize(ruta)
-        except OSError:
-            return False
-        if actual > 0 and actual == ultimo:
-            return True
-        ultimo = actual
-        time.sleep(espera)
-    return False
 
 
 def procesar_respuestas():
