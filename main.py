@@ -352,8 +352,6 @@ _notificador_comprobantes = integraciones.elegir(NOTIFICADOR_COMPROBANTES)
 # ---------------------------------------------------------------------------
 # Utilidades generales
 # ---------------------------------------------------------------------------
-
-
 # escribir_archivo, _borrar_si_existe, _mover y _archivo_estable viven en
 # utilidades_files.py — lectura/escritura de archivos genérica, importada al
 # principio del archivo.
