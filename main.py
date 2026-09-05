@@ -14,22 +14,29 @@ import json
 import logging
 import logging.handlers   # submodulo aparte: 'import logging' no lo trae
 import os
-import re
 import sqlite3
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-import xml.etree.ElementTree as ET
 import zipfile
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 import repositorio
 import integraciones
+from dominio.texto import _texto, _codigo, _campo_pipe, _marcas, _tipo_sunat
+from dominio.montos import formatear_decimal, _base_e_igv, _desglosar_igv
+from dominio.monto_en_letras import numero_a_letras
+from dominio.fechas import formatear_fecha_hora
+from dominio.comprobante import _nombre_base, _validar_campos_obligatorios, _linea_detalle
+from dominio.resumen_diario import _linea_rdi, _linea_trd
+from dominio.cdr import (
+    _TIPO_RC, _texto_de_nodo, _extraer_numeracion, _reconciliar_numeracion,
+    _datos_del_nombre_cdr, parsear_xml_cdr,
+)
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -200,27 +207,8 @@ _MAX_BLOQUEADOS_LOG = 10
 # daemon no la emite.
 _TIPOS_SFS = {"01", "03", "07", "08", "RC"}
 
-# Constantes.CONSTANTE_TIPO_DOCUMENTO_RBOLETAS: el SFS trata el resumen diario como
-# un tipo de documento más, con los mismos dos endpoints REST que todo lo demás
-# (GenerarComprobante.htm / enviarXML.htm) y el mismo patrón de dos pasadas. Puertas
-# adentro, SUNAT usa un flujo con ticket (sendSummary + getStatus sobre el mismo
-# billService) — confirmado contra el WSDL real de producción — pero eso lo resuelve
-# el SFS solo: el daemon no necesita hablar SOAP para esto, a diferencia de la
-# recuperación de CDR (que sí lo hace directo).
-_TIPO_RC = "RC"
-
-# La aplicación guarda el tipo por nombre, no con el código de SUNAT. NOTA_VENTA no
-# es un comprobante electrónico —es un documento interno— y por eso no se mapea:
-# queda fuera de _TIPOS_SFS y el daemon lo ignora.
-_TIPOS_POR_NOMBRE = {
-    "FACTURA":        "01",
-    "BOLETA":         "03",
-    "NOTA_CREDITO":   "07",
-    "NOTA_DEBITO":    "08",
-}
-
-# Todo se factura gravado al 18%: es lo que corresponde a los servicios de estética.
-_FACTOR_IGV = Decimal("1.18")
+# _TIPO_RC, la traducción de tipo por nombre y el factor de IGV viven en dominio/
+# (ver import al principio del archivo) junto con las funciones que los usan.
 
 # La aplicación guarda sus fechas con el reloj de su servidor de BD, que hoy corre
 # en UTC; SUNAT en cambio espera la fecha de emisión en hora local del emisor. Sin
@@ -264,19 +252,8 @@ _TIPOS_NOTA = {"07", "08"}
 # formato, no con 'Contado'.
 _TIPOS_SIN_FORMA_PAGO = {"03", "07", "08"}
 
-# Todos los parsers del SFS exigen 36 columnas en el detalle. Ojo con la nota de
-# débito: su mensaje de error dice "(30 columnas)", pero el bytecode compara contra
-# 36 igual que el resto. Guiarse por ese texto hace que el SFS rechace el archivo
-# con un mensaje que apunta justo al número equivocado.
-_COLS_DET = 36
-
-# PipeResumenBoletaParser del SFS: el .RDI no es una cabecera única sino una línea
-# por boleta con este mismo layout de 23 columnas; el .TRD es el desglose de
-# tributos de cada línea, 6 columnas, vinculado por posición (idLineaRd = número de
-# fila dentro del .RDI, 1-based). Confirmado decompilando el parser, mismo método
-# que para notas y ND.
-_COLS_RDI = 23
-_COLS_TRD = 6
+# _COLS_DET, _COLS_RDI y _COLS_TRD viven junto a las funciones que arman esas
+# líneas, en dominio/comprobante.py y dominio/resumen_diario.py.
 
 # El SFS identifica cada documento por su archivo de cabecera, y la extensión cambia
 # según el tipo (ver BandejaDocumentosServiceImpl): .CAB para factura y boleta, .NOT
@@ -395,160 +372,6 @@ _notificador_comprobantes = integraciones.elegir(NOTIFICADOR_COMPROBANTES)
 # ---------------------------------------------------------------------------
 # Utilidades generales
 # ---------------------------------------------------------------------------
-
-
-def _texto(valor, defecto: str = "") -> str:
-    """
-    Valor de BD como texto limpio, con respaldo si viene vacío o nulo. Evita el
-    str(None) == "None" que se colaba a los archivos cuando la columna era NULL.
-    """
-    return str(valor if valor is not None else "").strip() or defecto
-
-
-def _codigo(valor, defecto: str = "") -> str:
-    """Código SUNAT de dos dígitos: '1' -> '01'. Devuelve el respaldo si no hay dato."""
-    texto = _texto(valor)
-    return texto.zfill(2) if texto else defecto
-
-
-def _campo_pipe(valor, defecto: str = "") -> str:
-    """Texto apto para un archivo delimitado por pipes."""
-    return re.sub(r"[|\r\n\t]+", " ", _texto(valor)).strip() or defecto
-
-
-def _marcas(cantidad: int) -> str:
-    """Placeholders '?,?,?' para un IN de SQL."""
-    return ",".join("?" * cantidad)
-
-
-def _tipo_sunat(valor) -> str:
-    """
-    Código de comprobante de SUNAT a partir de lo que guarda la aplicación, que usa
-    nombres ('BOLETA') en vez de códigos. Si ya viene un código, se deja pasar.
-    """
-    texto = _texto(valor).upper()
-    if not texto:
-        return ""
-    return _TIPOS_POR_NOMBRE.get(texto, _codigo(texto))
-
-
-def _base_e_igv(total):
-    """
-    Separa un importe con IGV incluido en base imponible e impuesto.
-
-    La aplicación solo guarda el total cobrado. Se asume todo gravado al 18%, que es
-    lo que corresponde a los servicios de estética; un ítem exonerado o gratuito
-    necesitaría el tipo de afectación, que la base no tiene (ver README).
-    """
-    bruto = formatear_decimal(total)
-    base = (bruto / _FACTOR_IGV).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return float(base), float(bruto - base)
-
-
-def _desglosar_igv(precio_unitario, cantidad, total_linea):
-    """(valor unitario sin IGV, valor de venta de la línea, IGV de la línea)."""
-    # Los dos factores pasan por formatear_decimal, como ya hacia la linea de abajo:
-    # en SQL Server 'cantidad' es nvarchar, y multiplicar texto por un float reventaba
-    # el ciclo entero con TypeError cuando la linea no traia total.
-    if total_linea is not None:
-        total = total_linea
-    else:
-        total = float(formatear_decimal(precio_unitario, 6)
-                      * (formatear_decimal(cantidad, 6) or Decimal("1")))
-    valor_venta, igv = _base_e_igv(total)
-    cant = formatear_decimal(cantidad) or Decimal("1")
-    unitario = (Decimal(str(valor_venta)) / cant) if cant else Decimal("0")
-    return float(unitario), valor_venta, igv
-
-
-def formatear_decimal(valor, decimales: int = 2) -> Decimal:
-    """
-    Importe redondeado, con 2 decimales salvo que se pidan otros.
-
-    El valor unitario es el único campo que necesita más: se declara con 6 porque
-    SUNAT verifica que cantidad × valor unitario cuadre con el valor de venta, y
-    con 2 decimales la cuenta no cierra. Un servicio de S/10 en 3 unidades da
-    2.823333 por unidad; redondeado a 2.82, tres unidades suman 8.46 contra los
-    8.47 declarados como valor de venta.
-    """
-    if valor is None:
-        return Decimal(0).quantize(Decimal(1).scaleb(-decimales))
-    try:
-        return Decimal(str(valor)).quantize(Decimal(1).scaleb(-decimales),
-                                            rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError, TypeError):
-        return Decimal(0).quantize(Decimal(1).scaleb(-decimales))
-
-
-_UNIDADES = ("", "UNO", "DOS", "TRES", "CUATRO", "CINCO", "SEIS", "SIETE", "OCHO", "NUEVE",
-             "DIEZ", "ONCE", "DOCE", "TRECE", "CATORCE", "QUINCE", "DIECISEIS", "DIECISIETE",
-             "DIECIOCHO", "DIECINUEVE", "VEINTE")
-_DECENAS  = ("", "", "VEINTI", "TREINTA", "CUARENTA", "CINCUENTA", "SESENTA", "SETENTA",
-             "OCHENTA", "NOVENTA")
-_CENTENAS = ("", "CIENTO", "DOSCIENTOS", "TRESCIENTOS", "CUATROCIENTOS", "QUINIENTOS",
-             "SEISCIENTOS", "SETECIENTOS", "OCHOCIENTOS", "NOVECIENTOS")
-_NOMBRE_MONEDA = {"PEN": "SOLES", "USD": "DOLARES AMERICANOS", "EUR": "EUROS"}
-
-
-def _centenas_a_letras(n: int) -> str:
-    if n == 100:
-        return "CIEN"
-    partes = []
-    if n >= 100:
-        partes.append(_CENTENAS[n // 100])
-        n %= 100
-    if n <= 20:
-        if n:
-            partes.append(_UNIDADES[n])
-    elif n < 30:
-        # 21..29 se escriben juntos: VEINTIUNO, VEINTIDOS, ...
-        partes.append(_DECENAS[2] + _UNIDADES[n % 10])
-    else:
-        partes.append(_DECENAS[n // 10] + (f" Y {_UNIDADES[n % 10]}" if n % 10 else ""))
-    return " ".join(p for p in partes if p)
-
-
-def numero_a_letras(monto, moneda: str = "PEN") -> str:
-    """
-    Importe en palabras, como lo exige SUNAT en la leyenda 1000 del comprobante.
-
-    La aplicación no guarda este texto, así que se arma acá. El formato es el usual
-    en Perú: "CIENTO DIECIOCHO CON 00/100 SOLES".
-    """
-    valor = formatear_decimal(monto)
-    entero = int(valor)
-    centavos = int((valor - entero) * 100)
-
-    if entero == 0:
-        letras = "CERO"
-    else:
-        bloques = []
-        millones, resto = divmod(entero, 1_000_000)
-        miles, unidades = divmod(resto, 1000)
-        if millones:
-            bloques.append("UN MILLON" if millones == 1 else f"{_centenas_a_letras(millones)} MILLONES")
-        if miles:
-            bloques.append("MIL" if miles == 1 else f"{_centenas_a_letras(miles)} MIL")
-        if unidades:
-            bloques.append(_centenas_a_letras(unidades))
-        letras = " ".join(bloques)
-
-    return f"{letras} CON {centavos:02d}/100 {_NOMBRE_MONEDA.get(_texto(moneda, 'PEN').upper(), 'SOLES')}"
-
-
-def formatear_fecha_hora(fecha_raw) -> datetime:
-    """
-    La fecha tal como está guardada, sin mover la hora. Para lo que se le declara a
-    SUNAT hay que pasarla antes por fecha_local(): lo que hay en la BD está en UTC.
-    """
-    if isinstance(fecha_raw, datetime):
-        return fecha_raw
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(str(fecha_raw).strip(), fmt)
-        except (ValueError, AttributeError):
-            pass
-    raise ValueError(f"Fecha inválida: {fecha_raw!r}")
 
 
 def detectar_desfase_bd(conn) -> float:
@@ -858,12 +681,6 @@ def obtener_boletas_para_resumen(conn) -> list:
 # Generador de archivos SFS
 # ---------------------------------------------------------------------------
 
-def _nombre_base(ruc: str, tipo: str, num: str) -> str:
-    serie, corr = num.split("-", 1) if "-" in num else ("0000", num or "00000000")
-    nombre = f"{ruc}-{tipo}-{serie}-{corr}"
-    return re.sub(r'[<>:"/\\|?*\n\r\t]+', "_", nombre.strip())[:250]
-
-
 def _referencia_nota(comp: dict, tipo_comp: str, num_comp: str):
     """
     (codMotivo, desMotivo, tipDocAfectado, numDocAfectado) para una nota, o None si
@@ -920,54 +737,6 @@ def _referencia_nota(comp: dict, tipo_comp: str, num_comp: str):
         _MOTIVOS_NOTA.get(tipo_comp, {}).get(cod_motivo, "OTROS CONCEPTOS"),
     )
     return cod_motivo, des_motivo, tip_afectado, num_afectado
-
-
-def _validar_campos_obligatorios(comp: dict) -> list:
-    """
-    Campos sin los que no se puede armar un comprobante ni una línea del resumen
-    diario. Solo devuelve qué falta —no decide qué hacer con eso—, para que sirva
-    tanto a procesar_comprobante() como a obtener_boletas_para_resumen(): cada
-    camino de emisión define si bloquea del todo o solo excluye esa fila.
-
-    No repite lo que ya filtra la consulta SQL (numeracionComprobante IS NOT NULL);
-    igual se valida acá porque es la única garantía si algún día una fila llega por
-    otro camino, y porque una fecha ilegible pasaba hoy como una excepción genérica
-    sin motivo claro en el log.
-    """
-    faltantes = []
-    if not _texto(comp.get("numeracion_comprobante")):
-        faltantes.append("numeracion_comprobante")
-    try:
-        formatear_fecha_hora(comp.get("fecha_emision"))
-    except (ValueError, TypeError):
-        faltantes.append("fecha_emision")
-    if comp.get("total") is None:
-        faltantes.append("total")
-    return faltantes
-
-
-def _linea_detalle(item: dict) -> str:
-    """Una línea del archivo .det: las 36 columnas en el orden que lee el SFS."""
-    cant   = formatear_decimal(item.get("dec_cantidad") or item.get("cantidad_venta") or item.get("cantidad", 1))
-    # Con 6 decimales, no 2: es lo que hace cuadrar cantidad × valor unitario
-    # contra el valor de venta, que es lo que SUNAT verifica.
-    v_unit = formatear_decimal(item.get("valor"), 6)
-    v_vta  = formatear_decimal(item.get("valor_venta"))
-    igv_it = formatear_decimal(item.get("igv_venta"))
-    p_unit = formatear_decimal(item.get("precio"))
-
-    campos = [
-        _campo_pipe(item.get("medida"), "NIU"),
-        f"{cant:.2f}",
-        _campo_pipe(item.get("codigo_producto"), "-"),
-        "-",
-        _campo_pipe(item.get("descripcion"), "ITEM"),
-        f"{v_unit:.6f}",
-        f"{igv_it:.2f}", "1000", f"{igv_it:.2f}", f"{v_vta:.2f}", "IGV", "VAT", "10", "18.00",
-    ] + ["-"] * 19 + [
-        f"{p_unit:.2f}", f"{v_vta:.2f}", "0.00",
-    ]
-    return "|".join(campos[:_COLS_DET]) + "|\n"
 
 
 def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
@@ -1065,58 +834,6 @@ def procesar_comprobante(conn, comp: dict, ruc_emisor: str) -> bool:
     # confirma la recepción, y lo cierra el CDR de SUNAT.
     logger.info("Archivos SFS generados: %s", num_comp)
     return True
-
-
-def _linea_rdi(fecha_emision: str, fecha_resumen: str, boleta: dict, receptor: dict) -> str:
-    """
-    Una línea del .RDI: PipeResumenBoletaParser no lee una cabecera única sino una
-    línea por boleta con este mismo layout de 23 columnas.
-
-    Dos campos que parecen intercambiables y no lo son (verificado en
-    ConvertirRBoletasXML.ftl, que es lo que arma el XML final):
-      - tipDocResumen -> <cbc:DocumentTypeCode>: el TIPO de comprobante, "03" para
-        una boleta. Poner "1" acá lo rechaza SUNAT con el error 2241.
-      - tipEstado     -> <cbc:ConditionCode>: el estado de la línea, "1" = nueva.
-
-    Los bloques de documento modificado y de percepción son opcionales, y la
-    plantilla los emite con `<#if serDocModifico != "">` / `<#if tipRegPercepcion
-    != "">`: la condición es contra CADENA VACÍA, no contra "-". Un "-" ahí los
-    daría por presentes y armaría un XML con esos nodos rellenos de basura, así que
-    esos 8 campos van vacíos. Es lo contrario de lo que hace el resto de los
-    archivos del daemon, donde "-" es el relleno habitual.
-    """
-    tipo_doc_rec = _campo_pipe(receptor.get("tipo_documento"), "0")
-    num_doc_rec  = _campo_pipe(receptor.get("numero_documento"), "00000000")
-    grav  = formatear_decimal(boleta["gravadas"])
-    total = formatear_decimal(boleta["total"])
-    campos = [
-        fecha_emision, fecha_resumen, "03", boleta["numeracion_comprobante"],
-        tipo_doc_rec, num_doc_rec, "PEN",
-        f"{grav:.2f}", "0.00", "0.00", "0.00", "0.00", "0.00", f"{total:.2f}",
-        "", "", "", "",
-        "", "", "", "",
-        "1",
-    ]
-    # Una columna de más o de menos hace que el SFS rechace el archivo entero con
-    # un mensaje que no dice cuál falta; mejor que salte acá.
-    if len(campos) != _COLS_RDI:
-        raise ValueError(f".RDI: {len(campos)} columnas, se esperan {_COLS_RDI}")
-    return "|".join(campos) + "|\n"
-
-
-def _linea_trd(id_linea: int, boleta: dict) -> str:
-    """
-    Desglose de tributos de una línea del .RDI: 6 columnas, mismo patrón que el .tri
-    de un comprobante individual. id_linea es la posición (1-based) de la boleta
-    dentro del .RDI: es lo único que vincula ambos archivos, porque el parser no
-    guarda un identificador propio por línea.
-    """
-    grav = formatear_decimal(boleta["gravadas"])
-    igv  = formatear_decimal(boleta["igv"])
-    campos = [str(id_linea), "1000", "IGV", "VAT", f"{grav:.2f}", f"{igv:.2f}"]
-    if len(campos) != _COLS_TRD:
-        raise ValueError(f".TRD: {len(campos)} columnas, se esperan {_COLS_TRD}")
-    return "|".join(campos) + "|\n"
 
 
 def generar_resumen_diario(conn, ruc_emisor: str):
@@ -1354,12 +1071,6 @@ _SOBRE_CONSULTA = """<?xml version="1.0" encoding="UTF-8"?>
     </ser:getStatusCdr>
   </soapenv:Body>
 </soapenv:Envelope>"""
-
-
-def _texto_de_nodo(xml: str, etiqueta: str) -> str:
-    """Contenido de un nodo de la respuesta SOAP, sin importar su prefijo."""
-    m = re.search(rf"<(?:\w+:)?{etiqueta}>(.*?)</(?:\w+:)?{etiqueta}>", xml, re.S)
-    return m.group(1).strip() if m else ""
 
 
 def consultar_estado_sunat(ruc: str, tipo: str, numeracion: str):
@@ -2260,106 +1971,9 @@ def resetear_rechazados(conn, ruc_emisor: str):
             ", ".join(f"{t}-{n}" for t, n in agotados),
         )
 
-# ---------------------------------------------------------------------------
-# Parser CDR — respuestas SUNAT
-# ---------------------------------------------------------------------------
-
-def _iter_elementos(elem, ancs=()):
-    yield elem, ancs
-    for hijo in elem:
-        yield from _iter_elementos(hijo, ancs + (elem.tag.split("}")[-1],))
-
-
-def _extraer_numeracion(texto) -> str | None:
-    # La serie SUNAT son 4 caracteres alfanuméricos que arrancan con letra: F001,
-    # B001, y también BC01/FC01/BC03 en notas de crédito. El patrón anterior exigía
-    # 3 dígitos al final (\d{3}) y dejaba fuera esas series, con lo que el CDR de una
-    # nota de crédito quedaba sin numeración y su comprobante nunca pasaba a enviado=1.
-    # El resumen diario (RC-YYYYMMDD-NNN) tiene solo 2 letras antes del guión, así que
-    # necesita su propia alternativa: nunca calzaría con las 4 exigidas por la otra.
-    m = re.search(rf"{_TIPO_RC}-\d{{8}}-\d+|[A-Z][A-Z0-9]{{3}}-\d+", _texto(texto))
-    return m.group(0) if m else None
-
-
-def _respuestas_por_documento(root) -> list:
-    """
-    [(numeracion, codigo, descripcion)] de cada <cac:DocumentResponse> del CDR.
-
-    El esquema los declara con maxOccurs="unbounded": un CDR de resumen puede
-    traer uno por el resumen entero y otro por cada boleta que SUNAT observe. Sin
-    recorrerlos todos, esas observaciones se pierden — el comprobante queda
-    aceptado y nadie se entera de que una línea salió con reparos.
-    """
-    respuestas = []
-    for elem in root.iter():
-        if not isinstance(elem.tag, str) or elem.tag.split("}")[-1] != "DocumentResponse":
-            continue
-        datos = {}
-        for hijo in elem.iter():
-            if not isinstance(hijo.tag, str):
-                continue
-            tag = hijo.tag.split("}")[-1].lower()
-            texto = _texto(hijo.text)
-            if texto and tag in ("referenceid", "responsecode", "description") and tag not in datos:
-                datos[tag] = texto
-        if datos:
-            respuestas.append((
-                _extraer_numeracion(datos.get("referenceid", "")),
-                datos.get("responsecode"),
-                datos.get("description"),
-            ))
-    return respuestas
-
-
-def _reconciliar_numeracion(del_xml: str | None, nombre_archivo: str) -> str | None:
-    """
-    Numeración canónica del comprobante, cuando el XML y el nombre del archivo no
-    coinciden.
-
-    SUNAT escribe el número distinto según por dónde llegue el CDR. El de sendBill
-    —el envío normal, que entrega el SFS— trae 'F003-009595'. El de getStatusCdr
-    —la consulta que hace estado_en_sunat()— trae '20605858601-01-F003-9571': con
-    prefijo de RUC y tipo, y el correlativo SIN los ceros a la izquierda. Los dos
-    son CDR legítimos y firmados; simplemente no usan el mismo formato.
-
-    De ahí que el XML sirva para el estado y los códigos, pero no para la identidad:
-    _extraer_numeracion() sacaba 'F003-9571' de ese segundo formato y no existe
-    ninguna fila así en Comprobantes, que la guarda como 'F003-009571'. El nombre
-    del archivo, en cambio, es canónico en los dos caminos: lo arma _guardar_cdr()
-    desde el NUM_DOCU del SFS, y el SFS lo arma desde su propia tabla.
-
-    No se rellena con ceros a un ancho fijo a propósito: los 6 dígitos son
-    convención de esta aplicación, no de SUNAT —que admite hasta 8—, y fijarlos acá
-    rompería con cualquier otro emisor. Se comparan los correlativos como enteros,
-    que es la única equivalencia que vale sin importar el relleno.
-    """
-    del_nombre = _extraer_numeracion(nombre_archivo)
-    if not del_nombre:
-        return del_xml
-    if not del_xml or del_xml == del_nombre:
-        return del_nombre
-
-    serie_xml, _, corr_xml = del_xml.partition("-")
-    serie_arch, _, corr_arch = del_nombre.partition("-")
-    # Los resúmenes (RC-YYYYMMDD-NNN) no entran acá: su correlativo no es un entero
-    # suelto, así que isdigit() falla y se respeta lo que dijo el XML.
-    if serie_xml == serie_arch and corr_xml.isdigit() and corr_arch.isdigit() \
-            and int(corr_xml) == int(corr_arch):
-        return del_nombre
-    return del_xml
-
-
-def _datos_del_nombre_cdr(nombre: str) -> tuple:
-    """
-    (ruc, tipo) a partir del nombre del CDR: 'R20605858601-01-F003-009571.zip'.
-
-    Hacen falta para cerrar la fila en la bandeja del SFS, que se identifica por
-    NUM_RUC + TIP_DOCU + NUM_DOCU. Devuelve (None, None) si el nombre no tiene esa
-    forma, y quien llama simplemente no cierra nada.
-    """
-    m = re.match(r"R(\d{11})-([A-Z0-9]{2})-", _texto(nombre))
-    return (m.group(1), m.group(2)) if m else (None, None)
-
+# El parser de CDR (_iter_elementos, _extraer_numeracion, _respuestas_por_documento,
+# _reconciliar_numeracion, _datos_del_nombre_cdr, parsear_xml_cdr) vive en
+# dominio/cdr.py — puro procesamiento de XML/texto, importado al principio del archivo.
 
 def _cerrar_documento_en_sfs(ruc: str, tipo: str, numeracion: str):
     """
@@ -2412,60 +2026,6 @@ def _notificar_comprobante_aceptado(ruc: str, tipo: str, numeracion: str):
             "Notificador de comprobantes (%s) falló para %s-%s; no afecta el "
             "cierre del CDR.", NOTIFICADOR_COMPROBANTES, tipo, numeracion,
         )
-
-
-def parsear_xml_cdr(fuente) -> dict:
-    res = {"numeracion": None, "codigo": None, "descripcion": None,
-           "status": "PENDIENTE", "lineas": []}
-    try:
-        root = ET.fromstring(fuente) if isinstance(fuente, bytes) else ET.parse(fuente).getroot()
-        res["lineas"] = _respuestas_por_documento(root)
-        # Las descripciones que cuelgan de un <Response> son las buenas; cualquier otra
-        # queda de respaldo por si el CDR no trae ninguna en el lugar esperado.
-        descripciones, respaldo = [], []
-        for elem, ancs in _iter_elementos(root):
-            if not isinstance(elem.tag, str):
-                continue
-            tag  = elem.tag.split("}")[-1].lower()
-            text = _texto(elem.text)
-            if not text:
-                continue
-            if tag == "responsecode" and not res["codigo"]:
-                res["codigo"] = text
-            elif tag in {"description", "responsedescription"}:
-                if any("response" in a.lower() for a in ancs):
-                    descripciones.append(text)
-                elif tag == "description" and not respaldo:
-                    respaldo.append(text)
-            elif tag in {"referenceid", "id"} and not res["numeracion"]:
-                res["numeracion"] = _extraer_numeracion(text)
-
-        res["descripcion"] = " | ".join(dict.fromkeys(descripciones or respaldo)) or None
-
-        if not res["numeracion"]:
-            res["numeracion"] = _extraer_numeracion(res["descripcion"])
-        if not res["numeracion"] and isinstance(fuente, str):
-            res["numeracion"] = _extraer_numeracion(os.path.basename(fuente))
-
-        codigo = _texto(res["codigo"])
-        desc   = _texto(res["descripcion"]).lower()
-        # El ResponseCode manda: SUNAT solo devuelve 0 cuando acepta. Cualquier
-        # otro código es rechazo, aunque la descripción no diga "rechazado".
-        if codigo:
-            res["status"] = "ACEPTADO" if codigo.strip("0") == "" else "RECHAZADO"
-        elif "acept" in desc:
-            res["status"] = "ACEPTADO"
-        elif "rechaz" in desc or "error" in desc or "no autorizado" in desc:
-            res["status"] = "RECHAZADO"
-
-        # Aceptada con observaciones sigue siendo aceptada (ver _CDR_ACEPTADOS)
-        if res["status"] == "ACEPTADO" and "observ" in desc:
-            res["status"] = "OBSERVADO"
-
-    except Exception:
-        logger.exception("Error parseando CDR %s", fuente if isinstance(fuente, str) else "<bytes>")
-        res["status"] = "ERROR"
-    return res
 
 
 def _procesar_lineas_de_resumen(conn, numeracion_rc: str, boletas: list, parsed: dict) -> tuple:

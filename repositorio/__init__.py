@@ -20,6 +20,8 @@ indirecto hay que descifrarlo justo cuando algo esta fallando.
 """
 import urllib.parse
 
+from .puertos import RepositorioComprobantes
+
 _MOTORES = {
     "postgres":   "postgres",
     "postgresql": "postgres",
@@ -40,8 +42,8 @@ def motor_de(url: str) -> str:
     return _MOTORES[esquema]
 
 
-def elegir(url: str):
-    """El modulo adaptador que corresponde a esa URL."""
+def elegir(url: str) -> RepositorioComprobantes:
+    """El modulo adaptador que corresponde a esa URL. Ver puertos.py para el contrato."""
     nombre = motor_de(url)
     if nombre == "postgres":
         from . import postgres as impl

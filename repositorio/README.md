@@ -20,6 +20,10 @@ hay un mapeador genérico configurable, y es deliberado**: un archivo de sesenta
 líneas con su SQL a la vista se depura leyéndolo; un mapeo indirecto hay que
 descifrarlo justo cuando algo está fallando.
 
+Este mismo contrato está declarado en código en [`puertos.py`](puertos.py)
+(`RepositorioComprobantes`, un `typing.Protocol`) — no cambia nada en tiempo de
+ejecución, es la versión tipada de lo que sigue en prosa acá abajo.
+
 ---
 
 ## Las diez operaciones
