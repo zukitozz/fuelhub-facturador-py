@@ -2,7 +2,7 @@
 Reloj de la BD: mide el desfase horario contra el servidor y convierte una fecha de
 BD a hora local. No es dominio puro —detectar_desfase_bd() consulta la BD de la
 app— por eso no vive en dominio/, pero tampoco es un puerto propio: es un cálculo
-de infraestructura que usa main.py en varios lugares (ver fecha_local, más abajo).
+de infraestructura que usa aplicacion/ en varios lugares (ver fecha_local, más abajo).
 """
 import logging
 import os
@@ -10,6 +10,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from dominio.fechas import formatear_fecha_hora
+from aplicacion.bd_app import _bd
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +49,11 @@ def detectar_desfase_bd(conn) -> float:
     nada acá. Se redondea a media hora porque ninguna zona horaria usa una
     granularidad menor, y así un par de segundos de latencia no ensucian el valor.
     """
-    # Import diferido: evita el ciclo main <-> utilidades_timer (main importa este
-    # módulo al cargar) y, de paso, hace que un test que reemplace main._bd siga
-    # viéndose acá — se resuelve a través de main.py, no de una copia importada al
-    # cargar.
-    import main
-
     global _desfase_horas
     if DESFASE_BD_HORAS != "auto":
         return _desfase_horas
     try:
-        filas = main._bd().reloj(conn)
+        filas = _bd().reloj(conn)
         # Se compara la lectura "de pared" del servidor contra el reloj local.
         pared = filas[0]["con_zona"].replace(tzinfo=None)
         crudo = (pared - datetime.now()).total_seconds() / 3600

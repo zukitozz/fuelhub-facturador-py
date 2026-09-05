@@ -2,6 +2,7 @@ import os, sys, datetime, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["SFS_DATA_DIR"] = tempfile.mkdtemp()
 import main
+import sfs.archivos as archivos
 
 CAPTURADO = {}
 def fake_escribir(ruta, contenido):
@@ -9,14 +10,14 @@ def fake_escribir(ruta, contenido):
 
 def correr(boletas, tope):
     CAPTURADO.clear()
-    main.MAX_BOLETAS_RESUMEN = tope
-    main.obtener_boletas_para_resumen = lambda conn: list(boletas)
-    main._boletas_en_resumenes_activos = lambda ruc: set()
-    main.obtener_receptor = lambda conn, fid: {"tipo_documento": "0", "numero_documento": "0"}
-    main.escribir_archivo = fake_escribir
-    main._registrar_resumen = lambda rc, nums: None
-    main._siguiente_numeracion_rc = lambda f: "RC-" + f + "-001"
-    doc = main.generar_resumen_diario(None, "20609785269")
+    archivos.MAX_BOLETAS_RESUMEN = tope
+    archivos.obtener_boletas_para_resumen = lambda conn: list(boletas)
+    archivos._boletas_en_resumenes_activos = lambda ruc: set()
+    archivos.obtener_receptor = lambda conn, fid: {"tipo_documento": "0", "numero_documento": "0"}
+    archivos.escribir_archivo = fake_escribir
+    archivos._registrar_resumen = lambda rc, nums: None
+    archivos._siguiente_numeracion_rc = lambda f: "RC-" + f + "-001"
+    doc = archivos.generar_resumen_diario(None, "20609785269")
     rdi = CAPTURADO.get(".RDI", "")
     lineas = [l for l in rdi.split("\n") if l.strip()]
     fechas = {l.split("|")[0] for l in lineas}
