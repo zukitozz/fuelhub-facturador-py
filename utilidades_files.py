@@ -6,6 +6,8 @@ mecanismo de bajo nivel.
 """
 import logging
 import os
+
+from config import MINUTOS_CDR_VACIO
 import time
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,10 @@ def _archivo_estable(ruta: str, intentos: int = 5, espera: float = 0.5) -> bool:
     True cuando el tamaño del archivo dejó de cambiar. SUNAT/SFS deja el ZIP en RPTA
     mientras todavía lo escribe y watchdog avisa apenas se crea: abrirlo de inmediato
     daba BadZipFile —y lo mandaba a errores/— sobre un archivo que estaba sano.
+
+    Un archivo que se queda en 0 bytes nunca se da por estable, y eso es correcto: no
+    hay nada que abrir. Distinguir ese caso de uno que todavía crece es tarea de quien
+    llama (ver _archivo_abandonado), porque acá no se puede saber cuánto lleva así.
     """
     ultimo = -1
     for _ in range(intentos):
@@ -57,3 +63,30 @@ def _archivo_estable(ruta: str, intentos: int = 5, espera: float = 0.5) -> bool:
         ultimo = actual
         time.sleep(espera)
     return False
+
+
+def _archivo_abandonado(ruta: str) -> bool:
+    """
+    True si el archivo lleva demasiado tiempo vacío como para seguir esperándolo.
+
+    Un ZIP que se corta a medio escribir —un corte del lado del SFS, disco lleno—
+    queda en 0 bytes para siempre. _archivo_estable() nunca lo da por bueno, asi que
+    el barrido lo saltaba en cada ciclo con el mismo INFO de "aún se está escribiendo"
+    sin que nadie lo resolviera. Visto en produccion el 2026-09-05: horas repitiendo
+    esa linea.
+
+    Y no era solo ruido en el log: _tiene_cdr() solo mira que el archivo exista, asi
+    que ese ZIP vacio hacia que recuperar_cdr_pendientes() diera por recuperado el CDR
+    y no volviera a consultarle a SUNAT. El comprobante quedaba en enviado=0 aunque
+    SUNAT lo hubiera aceptado, sin ninguna via de salida.
+
+    El umbral de tiempo es lo que separa un archivo abandonado de uno que recien
+    empieza: los dos miden 0 bytes, y la unica diferencia es hace cuanto.
+    """
+    try:
+        if os.path.getsize(ruta) > 0:
+            return False
+        edad = time.time() - os.path.getmtime(ruta)
+    except OSError:
+        return False
+    return edad > MINUTOS_CDR_VACIO * 60

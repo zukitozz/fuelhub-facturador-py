@@ -8,7 +8,7 @@ import threading
 import time
 from datetime import datetime
 
-from config import _REINTENTOS_PATH, _ESPERA_MAX_RED_MIN
+from config import _REINTENTOS_PATH, _ESPERA_MAX_RED_MIN, MAX_CONSULTAS_FALLIDAS
 from dominio.texto import _texto
 from utilidades_files import escribir_archivo
 
@@ -31,6 +31,17 @@ _lock_reintentos = threading.Lock()
 # arregla esperando.
 _SENALES_DE_RED = (
     "could not send message",
+    # SAAJ es la capa SOAP de Java del SFS. "Problem writing SAAJ model to stream:
+    # e-factura.sunat.gob.pe" es que no pudo ni escribir la solicitud: el envio nunca
+    # salio. Confirmado en produccion (corte del 2026-09-10), donde dejo 6 resumenes
+    # sin salida reteniendo 1195 boletas.
+    #
+    # Dice "writing" a proposito y no "saaj model" a secas: SAAJ tambien lanza un
+    # "Problem READING SAAJ model from stream", y ese es el caso opuesto --la solicitud
+    # SI salio y lo que fallo fue leer la respuesta--. Ahi el envio pudo haber llegado a
+    # SUNAT, y tratarlo como corte de red autorizaria a reenviarlo: exactamente el
+    # duplicado que el resto de este archivo se esfuerza en evitar.
+    "problem writing saaj model",
     "connection timed out",
     "connect timed out",
     "read timed out",
@@ -171,3 +182,76 @@ def _anotar_espera_de_red(numeracion: str, tipo: str, motivo: str) -> tuple:
         datos[numeracion] = registro
         _guardar_reintentos(datos)
         return cortes, minutos
+
+
+def _contar_consulta_fallida(tipo: str, numeracion: str, codigo: str, mensaje: str) -> int:
+    """
+    Suma una consulta sin respuesta útil y devuelve cuántas seguidas lleva.
+
+    Va en reintentos.json, bajo su propia clave, por el mismo motivo que el resto del
+    archivo: PM2 reinicia el daemon solo, y un contador en memoria volvería a cero en
+    cada reinicio —justo cuando mas importa saber que esto lleva horas—. La clave
+    incluye el tipo porque una consulta se hace por (tipo, numeracion), a diferencia
+    del contador de reenvios, que se lleva solo por numeracion.
+    """
+    clave = f"consulta:{tipo}-{numeracion}"
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        registro = datos.get(clave) or {}
+        veces = int(registro.get("consultas", 0)) + 1
+        datos[clave] = {
+            "tipo": tipo,
+            "consultas": veces,
+            "ultimo": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "codigo": codigo,
+            "motivo": mensaje or registro.get("motivo", ""),
+        }
+        _guardar_reintentos(datos)
+        return veces
+
+
+def _olvidar_consulta_fallida(tipo: str, numeracion: str):
+    """SUNAT respondió algo concluyente: la racha de consultas fallidas ya no importa."""
+    clave = f"consulta:{tipo}-{numeracion}"
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        if datos.pop(clave, None) is not None:
+            _guardar_reintentos(datos)
+
+
+def _horas_en_proceso(numeracion: str) -> float:
+    """
+    Horas que lleva un ticket contestando "todavía lo estoy procesando".
+
+    Se anota la primera vez y de ahí se mide. Va en reintentos.json y no en memoria
+    por el mismo motivo que el resto del archivo: PM2 reinicia el daemon solo, y un
+    contador en memoria arrancaría de cero en cada reinicio —justo cuando lo que hace
+    falta saber es que esto lleva horas—.
+
+    La cuenta arranca al primer "en proceso" y no cuando se genero el resumen: lo que
+    interesa es hace cuanto que SUNAT viene diciendo lo mismo, no cuanto hace que
+    existe el documento.
+    """
+    clave = f"proceso:{numeracion}"
+    ahora = datetime.now()
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        registro = datos.get(clave) or {}
+        desde = registro.get("desde")
+        if not desde:
+            datos[clave] = {"desde": ahora.strftime("%Y-%m-%d %H:%M:%S")}
+            _guardar_reintentos(datos)
+            return 0.0
+    try:
+        return (ahora - datetime.strptime(desde, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600
+    except ValueError:
+        return 0.0
+
+
+def _olvidar_en_proceso(numeracion: str):
+    """El ticket dejó de estar en proceso: la cuenta de horas ya no importa."""
+    clave = f"proceso:{numeracion}"
+    with _lock_reintentos:
+        datos = _leer_reintentos()
+        if datos.pop(clave, None) is not None:
+            _guardar_reintentos(datos)

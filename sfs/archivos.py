@@ -20,7 +20,10 @@ from dominio.cdr import _TIPO_RC
 from utilidades_files import escribir_archivo, _borrar_si_existe
 from utilidades_timer import fecha_local
 from aplicacion.lecturas import obtener_receptor, obtener_items, obtener_boletas_para_resumen, _avisar_incompleto
-from estado.resumenes import _boletas_en_resumenes_activos, _registrar_resumen, _siguiente_numeracion_rc, _nombre_archivo_rc
+from estado.resumenes import (
+    _boletas_en_resumenes_activos, _registrar_resumen, _siguiente_numeracion_rc,
+    _nombre_archivo_rc, _motivo_para_frenar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +212,21 @@ def generar_resumen_diario(conn, ruc_emisor: str):
         )
 
     hoy = datetime.now()
+    numeraciones = [b["numeracion_comprobante"] for b in boletas]
+
+    # Antes de armar nada: si este mismo lote ya viene girando en falso, frenar. Sin
+    # esto el ciclo armó, mandó y descartó 84 resúmenes en un día (2026-09-09),
+    # declarando las mismas boletas una y otra vez ante SUNAT.
+    motivo = _motivo_para_frenar(numeraciones, hoy.strftime("%Y%m%d"))
+    if motivo:
+        logger.error(
+            "NO se genera el resumen diario: %s. REQUIERE REVISIÓN MANUAL: verificar en "
+            "el portal de SUNAT cuáles de esas boletas ya están declaradas antes de "
+            "volver a intentarlo; cada intento de más es un duplicado que solo se "
+            "deshace con una comunicación de baja.", motivo,
+        )
+        return None
+
     fecha_resumen = hoy.strftime("%Y-%m-%d")
     numeracion_rc = _siguiente_numeracion_rc(hoy.strftime("%Y%m%d"))
     base = _nombre_archivo_rc(ruc_emisor, numeracion_rc)
@@ -224,7 +242,6 @@ def generar_resumen_diario(conn, ruc_emisor: str):
     escribir_archivo(os.path.join(SFS_DATA_DIR, f"{base}.RDI"), "".join(lineas_rdi))
     escribir_archivo(os.path.join(SFS_DATA_DIR, f"{base}.TRD"), "".join(lineas_trd))
 
-    numeraciones = [b["numeracion_comprobante"] for b in boletas]
     _registrar_resumen(numeracion_rc, numeraciones)
     # Con un tope de 200 la lista entera hacia una linea de log de miles de
     # caracteres por resumen. El detalle completo vive en resumenes.json.

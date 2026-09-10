@@ -9,7 +9,7 @@ Factura, nota de crédito y nota de débito salen de a una; las boletas salen ag
 - **Generador**: cada `INTERVALO_GENERACION_SEG` (60s) revisa si hay comprobantes por enviar.
 - **CDR**: vigila `RPTA` y procesa el ZIP en cuanto SUNAT responde, con un barrido de respaldo cada `INTERVALO_BARRIDO_RPTA_SEG`.
 
-**El SFS no vigila `DATA`**: solo la escanea al cargar su pantalla (`cargarArchivosContribuyente`, que cuelga de `CargarPantalla.htm`). Ni `GenerarComprobante.htm` ni `enviarXML.htm` lo hacen — esos operan sobre lo que ya está en su bandeja. Por eso el daemon llama a `sincronizar_bandeja_sfs()` al inicio de cada ciclo y antes de entregar documentos. Sin eso dependería de que alguien tuviera la bandeja abierta en el navegador: con la ventana cerrada los archivos se quedan en `DATA` y **no se emite nada**.
+**El SFS no vigila `DATA`**: solo la escanea en el refresco de su pantalla (`cargarArchivosContribuyente`, que cuelga de `ActualizarPantalla.htm`, **no** de `CargarPantalla.htm` pese a lo que sugiere el nombre). Ni `GenerarComprobante.htm` ni `enviarXML.htm` lo hacen — esos operan sobre lo que ya está en su bandeja. Por eso el daemon llama a `sincronizar_bandeja_sfs()` al inicio de cada ciclo y antes de entregar documentos. Sin eso dependería de que alguien tuviera la bandeja abierta en el navegador: con la ventana cerrada los archivos se quedan en `DATA` y **no se emite nada**.
 
 ## Tipos de comprobante
 
@@ -116,6 +116,33 @@ Tres reglas del formato que el `.RDI` no perdona:
 
 SUNAT puede aceptar el resumen y aun así observar boletas puntuales: cada una viene en su propio `<cac:DocumentResponse>`, que el esquema declara repetible. El daemon los recorre todos, guarda la observación en la `Factura` que corresponde y lo avisa en el log.
 
+### Reencolar un resumen trabado a mano
+
+Quien envía a SUNAT **no es el daemon, es el SFS** — y el SFS trabaja sobre los archivos de `SFS_DATA_DIR`, no sobre la tabla `DOCUMENTO`. Un resumen vive entonces en tres lugares, y reencolarlo a mano exige limpiar **los tres juntos y en el mismo momento**:
+
+1. su fila en `DOCUMENTO` (la bandeja del SFS),
+2. su entrada en `resumenes.json` (el mapeo de qué boletas lleva),
+3. su `.RDI` y `.TRD` en `SFS_DATA_DIR`.
+
+**Dejar el archivo atrás es lo que abre la carrera.** `sincronizar_bandeja_sfs()` obliga al SFS a releer `DATA` en cada ciclo: el `.RDI` huérfano se registra de nuevo en la bandeja con su **numeración original** y sale otra vez, mientras el daemon —que ya dio el resumen por perdido— arma uno nuevo con las mismas boletas. Las dos vías mandan el mismo contenido a SUNAT sin que ninguna sepa de la otra.
+
+Pasó en producción el 2026-09-10: el resumen original salió aceptado y el nuevo volvió con `2282 - Existe documento ya informado anteriormente`. No hubo declaración doble porque SUNAT deduplica por contenido — pero eso es suerte, no garantía, y una declaración doble solo se deshace con una comunicación de baja.
+
+Cuando el daemon descarta un resumen por su cuenta ya limpia los tres (`_descartar_archivos_de_resumen()`). Esto aplica a la intervención manual.
+
+### Cuando el daemon se niega a generar el resumen
+
+Si un envío falla **sin devolver ticket**, el daemon da por hecho que SUNAT no lo recibió y devuelve sus boletas a la cola. Esa inferencia no siempre vale: durante un bloqueo prolongado un envío puede haber llegado igual y quedar encolado del lado de SUNAT, que lo acepta al recuperarse. Por eso la entrada de `resumenes.json` **no se borra**, solo se marca descartada — es el único registro de qué boletas llevaba, y sin él un CDR tardío no puede cerrar nada. Si ese CDR llega, el daemon cierra las boletas y avisa en el log; si además ya habían viajado en otro resumen, lo dice con `ERROR`, porque hay un **duplicado ante SUNAT que solo se deshace con una comunicación de baja**.
+
+Contra el bucle que eso puede generar hay dos frenos. Al alcanzarlos el daemon **deja de emitir resúmenes** y lo dice en el log:
+
+```
+NO se genera el resumen diario: 143 boleta(s) ya se declararon 3 veces o mas sin cerrarse: ...
+REQUIERE REVISIÓN MANUAL: ...
+```
+
+Es deliberado: frenar cuesta una demora, seguir declarando cuesta un trámite por boleta. Antes de subir `MAX_DECLARACIONES_BOLETA` o `MAX_RESUMENES_DIA` hay que **verificar en el portal de SUNAT cuáles de esas boletas ya están declaradas**. El detalle de qué llevó cada resumen está en `resumenes.json`, y si esa entrada ya no está se puede reconstruir desde el XML firmado en `FIRMA/`, que lista sus boletas en `<cbc:ID>`.
+
 ## Requisitos
 
 Python 3.10+, la base de la aplicación accesible (PostgreSQL o SQL Server), SFS v2.1 corriendo localmente y [PM2](https://pm2.keymetrics.io/) (opcional, para gestionar el proceso).
@@ -176,6 +203,13 @@ EMISOR_RUC=                      # vacío = se lee de la BD
 INTERVALO_GENERACION_SEG=60
 INTERVALO_BARRIDO_RPTA_SEG=30    # barrido de respaldo de RPTA
 MAX_REINTENTOS_RECHAZO=3         # reenvíos de un comprobante rechazado
+MAX_BOLETAS_RESUMEN=200          # boletas por resumen diario (tope de SUNAT: 500)
+MAX_DECLARACIONES_BOLETA=3       # veces que una boleta puede entrar a un resumen
+MAX_RESUMENES_DIA=20             # resúmenes por día antes de frenar
+DIAS_RETENCION_RESUMENES=30      # cuánto se guarda el detalle en resumenes.json
+MAX_CONSULTAS_FALLIDAS=10        # consultas seguidas sin respuesta útil
+HORAS_TICKET_EN_PROCESO=3        # antes de escalar un ticket "en proceso"
+MINUTOS_CDR_VACIO=10             # antes de apartar un CDR que quedó en 0 bytes
 CONSULTA_SUNAT_TRAS_MIN=10       # minutos sin CDR antes de consultar a SUNAT
 DESFASE_BD_HORAS=auto            # "auto" lo mide en cada ciclo
 LOG_MAX_MB=5                     # rotación de facturador.log

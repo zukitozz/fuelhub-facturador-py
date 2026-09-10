@@ -34,6 +34,11 @@ DB_TIMEOUT_SEG = int(os.getenv("DB_TIMEOUT_SEG", "30"))
 SFS_DATA_DIR = p if os.path.exists(p := os.getenv("SFS_DATA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\DATA")) else os.path.join(_BASE, "sunat_archivos", "DATA")
 SFS_RPTA_DIR = p if os.path.exists(p := os.getenv("SFS_RPTA_DIR", r"C:\SFS_v-2.1\sunat_archivos\sfs\RPTA")) else os.path.join(_BASE, "sunat_archivos", "RPTA")
 
+# Donde el SFS deja el XML firmado de cada documento. Se deriva de DATA en vez de
+# configurarse aparte porque son hermanas dentro de sunat_archivos/sfs: si alguien
+# mueve la instalacion, DATA ya trae la ruta nueva y esta la sigue sola.
+_SFS_FIRMA_DIR = os.path.join(os.path.dirname(SFS_DATA_DIR), "FIRMA")
+
 SFS_BD_PATH  = os.getenv("SFS_BD_PATH",  r"C:\SFS_v-2.1\bd\BDFacturador.db")
 SFS_BASE_URL = os.getenv("SFS_BASE_URL", "http://localhost:9000")
 
@@ -77,9 +82,42 @@ NOTIFICADOR_COMPROBANTES = os.getenv("NOTIFICADOR_COMPROBANTES", "noop").strip()
 # un mensaje genérico reutilizado—. Cualquier otro código se toma como incierto.
 _CODIGOS_NO_REGISTRADO = ("0127",)
 
+# Códigos que dicen que la consulta falló, no que el comprobante no exista.
+# Verificado contra el catálogo de códigos de SUNAT:
+#   0100  El sistema no puede responder su solicitud. Intente nuevamente
+#   0125  No se pudo obtener la constancia
+#   0126  El ticket no le pertenece al usuario
+# Son fallas del lado de SUNAT al recuperar el CDR, así que la consulta se repite más
+# tarde en vez de darla por perdida. Ojo con la distinción: que sean transitorios NO
+# habilita a reenviar el comprobante —sigue sin saberse si SUNAT lo tiene—, solo a
+# volver a preguntar. El único que autoriza el reenvío es el 0127, y vive aparte.
+#
+# El caso que lo motivó (2026-09-05): F003-006240 recibía 0125 en cada consulta y
+# quedaba en 'desconocido' para siempre, repitiendo un WARNING que nadie termina de
+# notar, mientras en SUNAT la factura estaba aceptada.
+_CODIGOS_CONSULTA_FALLIDA = ("0100", "0125", "0126")
+
+# Cuántas consultas seguidas pueden fallar antes de reportar el comprobante como
+# bloqueado. Sin este tope, un servicio caído por días no se distingue de uno que
+# tarda un minuto: los dos se ven igual en el log.
+MAX_CONSULTAS_FALLIDAS = int(os.getenv("MAX_CONSULTAS_FALLIDAS", "10"))
+
 # Cuánto esperar antes de preguntarle a SUNAT por un comprobante que ya se envió y
 # sigue sin CDR. Por debajo de esto lo más probable es que el CDR solo esté demorando.
 CONSULTA_SUNAT_TRAS_MIN = int(os.getenv("CONSULTA_SUNAT_TRAS_MIN", "10"))
+
+# Cuántas horas puede un ticket contestar "todavía lo estoy procesando" antes de que
+# el aviso escale. SUNAT normalmente tarda minutos, así que 3 horas es holgado de
+# sobra; el numero importa por el otro lado, porque un resumen estuvo 24 horas asi
+# --con 200 boletas retenidas y ya muerto del lado de SUNAT-- sin que nada lo
+# señalara. El max(1, ...) evita que un 0 en el .env convierta cada consulta normal
+# en una alarma.
+HORAS_TICKET_EN_PROCESO = max(1, int(os.getenv("HORAS_TICKET_EN_PROCESO", "3")))
+
+# Cuánto puede quedarse un CDR en 0 bytes antes de darlo por abandonado. Tiene que
+# ser holgado frente a lo que tarda el SFS en escribir un ZIP —segundos— para no
+# apartar uno que todavía se está escribiendo.
+MINUTOS_CDR_VACIO = int(os.getenv("MINUTOS_CDR_VACIO", "10"))
 # Cada cuánto se puede volver a consultar el mismo documento, para no golpear el
 # servicio de SUNAT en cada ciclo por algo que sigue igual.
 _COOLDOWN_CONSULTA_SEG = 900
@@ -125,6 +163,16 @@ _ESTADOS_BLOQUEADO = ("05", "06", "10")
 # cada pasada.
 _ESTADOS_CERRADOS = ("03", "04")
 
+# Estados en los que un resumen sigue en juego: ya salio hacia SUNAT y todavia puede
+# resolverse. Lo usan las dos puntas del mismo flujo --la consulta por ticket
+# (_resumenes_con_ticket) y el cierre una vez procesado el CDR
+# (_cerrar_resumen_en_sfs)--, y viven de una sola constante justamente porque se
+# desincronizaron: al ampliar solo la consulta para rescatar los resumenes en '05',
+# el cierre siguio exigiendo '08'/'09', asi que un resumen rescatado se consultaba
+# para siempre y nunca podia cerrarse. Quedan afuera los cerrados, y tambien el '01'
+# y el '02': ahi el resumen todavia no salio, y darlo por aceptado seria mentir.
+_ESTADOS_RESUMEN_ABIERTO = ("05", "06", "08", "09", "10")
+
 # Cuántas veces se reenvía un comprobante que SUNAT rechazó. El reenvío manda
 # exactamente los mismos datos, así que si el rechazo es por un dato mal armado el
 # resultado no cambia: sin tope, el daemon reenvía cada ciclo indefinidamente. Al
@@ -150,6 +198,29 @@ MOTIVO_NOTA_POR_DEFECTO = os.getenv("MOTIVO_NOTA_POR_DEFECTO", "").strip()
 # El max(1, ...) no es paranoia: con un 0 en el .env el resumen salia vacio, y con
 # un negativo descartaba boletas en silencio.
 MAX_BOLETAS_RESUMEN = max(1, min(int(os.getenv("MAX_BOLETAS_RESUMEN", "200")), 500))
+
+# Frenos contra el bucle de redeclaración. Visto en produccion el 2026-09-09, tras un
+# bloqueo de SUNAT de ~19 horas: 84 resumenes en un dia —lo normal son 2— y 143 boletas
+# declaradas 40 veces cada una, sin que nada lo notara ni lo frenara en horas.
+#
+# El ciclo era: el envio falla sin ticket, se descarta el resumen, las boletas vuelven a
+# la cola, se arma otro, SUNAT contesta "2282 - Existe documento ya informado
+# anteriormente", y otra vez. Cada vuelta suma un duplicado ante SUNAT, y un duplicado
+# solo se deshace con una comunicacion de baja: por eso acá conviene errar por frenar de
+# mas. Detenerse y pedir intervencion cuesta una demora; seguir declarando cuesta un
+# tramite por cada boleta.
+#
+# Son dos topes porque atajan el problema en momentos distintos: el de declaraciones
+# frena el lote concreto que esta girando en falso, y el diario es la red de seguridad
+# por si el bucle aparece de una forma que no previmos.
+MAX_DECLARACIONES_BOLETA = max(1, int(os.getenv("MAX_DECLARACIONES_BOLETA", "3")))
+MAX_RESUMENES_DIA = max(1, int(os.getenv("MAX_RESUMENES_DIA", "20")))
+
+# Cuanto se conserva la entrada de un resumen ya resuelto en resumenes.json. El margen
+# es amplio a proposito: ese archivo es el unico registro de que boletas llevo cada
+# resumen, y es lo que permitio reconstruir las 143 del incidente del 2026-09-09.
+# Perderlo temprano deja ciego al proximo diagnostico, y lo que se ahorra son kilobytes.
+DIAS_RETENCION_RESUMENES = max(1, int(os.getenv("DIAS_RETENCION_RESUMENES", "30")))
 
 # Techo del backoff con el que se reintenta un comprobante trabado por un corte de
 # red. No gasta presupuesto de reintentos (ver _es_falla_de_red en estado/reintentos.py),
@@ -270,11 +341,26 @@ _CDR_ACEPTADOS = {"ACEPTADO", "OBSERVADO"}
 # es text y no tiene límite, pero un mensaje enorme de SUNAT no aporta nada.
 _MAX_ERRORS_SQL = 4000
 
+# DOCUMENTO.DES_OBSE del SFS es VARCHAR(250). SQLite no lo hace cumplir, pero la
+# aplicacion Java si lo lee con ese ancho: pasarse es arriesgarse a que lo corte de
+# una forma que no controlamos.
+_MAX_DES_OBSE = 250
+
 # Códigos de getStatus (distintos de los de getStatusCdr): 0 y 99 traen el CDR —el
 # 99 es el de un resumen procesado CON errores, y su CDR explica cuáles—, mientras
 # que el 98 significa que SUNAT todavía lo está procesando.
+# SUNAT no es consistente consigo mismo en este mismo servicio: verificado en
+# producción el 2026-09-06, la aceptación vuelve como '0' —un carácter— y el "en
+# proceso" como '0098' —cuatro—. Por eso los códigos se normalizan antes de comparar
+# (ver _norm_codigo_ticket): con las constantes escritas a mano, '0098' == '98' daba
+# False siempre y la rama de "en proceso" era código muerto.
 _TICKET_CON_CDR    = ("0", "98", "99")
 _TICKET_EN_PROCESO = "98"
+# Un ticket se consume al consultarlo: a la segunda vez SUNAT responde con este
+# código y ya no hay CDR que recuperar por esa vía. Es el único veredicto definitivo
+# de la consulta de tickets —todo lo demás merece otro intento— y por eso vale la
+# pena distinguirlo en vez de tratarlo como una falla más.
+_TICKET_NO_EXISTE = "127"
 
 # FuelHub core: recibe los cierres de turno y de día (Cierreturnos/Cierredias con
 # enviado=0, ver aplicacion/ciclo_cierres.py). Solo existe en instalaciones de

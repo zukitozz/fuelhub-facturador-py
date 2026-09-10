@@ -10,8 +10,9 @@ import os
 import urllib.error
 import urllib.request
 
-from config import SUNAT_CONSULTA_URL, SOL_USUARIO, SOL_CLAVE, _CODIGOS_NO_REGISTRADO, SFS_RPTA_DIR
+from config import SUNAT_CONSULTA_URL, SOL_USUARIO, SOL_CLAVE, _CODIGOS_NO_REGISTRADO, SFS_RPTA_DIR, _CODIGOS_CONSULTA_FALLIDA, MAX_CONSULTAS_FALLIDAS
 from dominio.cdr import _texto_de_nodo
+from estado.reintentos import _contar_consulta_fallida, _olvidar_consulta_fallida
 
 logger = logging.getLogger(__name__)
 
@@ -108,13 +109,43 @@ def estado_en_sunat(ruc: str, tipo: str, numeracion: str) -> str:
     if codigo is None:
         return "desconocido", None, mensaje
     if cdr:
+        _olvidar_consulta_fallida(tipo, numeracion)
         return "registrado", cdr, mensaje
     if codigo in _CODIGOS_NO_REGISTRADO:
+        _olvidar_consulta_fallida(tipo, numeracion)
         return "no_registrado", None, mensaje
+
+    # Un código de consulta fallida no dice nada del comprobante: dice que SUNAT no
+    # pudo traer la constancia. Se vuelve a preguntar más tarde en vez de dar el
+    # comprobante por perdido, pero se lleva la cuenta: si el servicio no se
+    # recupera, alguien tiene que enterarse.
+    fallidas = _contar_consulta_fallida(tipo, numeracion, codigo, mensaje)
+    if codigo in _CODIGOS_CONSULTA_FALLIDA:
+        if fallidas >= MAX_CONSULTAS_FALLIDAS:
+            logger.error(
+                "%s-%s lleva %d consultas seguidas sin respuesta útil de SUNAT "
+                "(%s: %s). REQUIERE REVISIÓN MANUAL: verificar en el portal de SUNAT "
+                "si el comprobante está aceptado.",
+                tipo, numeracion, fallidas, codigo, mensaje,
+            )
+        else:
+            logger.info(
+                "SUNAT no pudo darnos la constancia de %s-%s (%s: %s); "
+                "se vuelve a consultar más tarde (%d/%d).",
+                tipo, numeracion, codigo, mensaje, fallidas, MAX_CONSULTAS_FALLIDAS,
+            )
+        return "desconocido", None, mensaje
+
     logger.warning(
         "SUNAT respondió por %s-%s un código que no sabemos interpretar (%s: %s); "
         "no se reenvía por las dudas.", tipo, numeracion, codigo, mensaje,
     )
+    if fallidas >= MAX_CONSULTAS_FALLIDAS:
+        logger.error(
+            "%s-%s lleva %d consultas seguidas con el código %s. REQUIERE REVISIÓN "
+            "MANUAL: el daemon no sabe interpretarlo y no va a resolverse solo.",
+            tipo, numeracion, fallidas, codigo,
+        )
     return "desconocido", None, mensaje
 
 
@@ -125,14 +156,14 @@ def _guardar_cdr(ruc: str, tipo: str, numeracion: str, cdr: bytes, mensaje: str)
     De ahí lo levanta el hilo CDR y lo procesa como cualquier otro. El nombre
     importa más de lo que parece: el XML de un CDR de consulta trae la numeración en
     otro formato que la de un envío normal, así que es el nombre —armado desde el
-    NUM_DOCU canónico— el que permite reconciliarla (ver dominio/cdr.py:
-    _reconciliar_numeracion). Se escribe con nombre temporal y se renombra para que
-    watchdog no lo levante a medio escribir.
+    NUM_DOCU canónico— el que permite reconciliarla (ver _reconciliar_numeracion).
+    Se escribe con nombre temporal y se renombra para que watchdog no lo levante a
+    medio escribir.
 
     Lo que este camino NO deja resuelto, a diferencia del normal, es la fila en la
     bandeja del SFS: sigue con el error de red que la trajo hasta acá. La cierra
-    sfs.bd._cerrar_documento_en_sfs() una vez que el comprobante quedó cerrado en la
-    BD de la aplicación, no antes.
+    _cerrar_documento_en_sfs() una vez que el comprobante quedó cerrado en la BD de
+    la aplicación, no antes.
     """
     os.makedirs(SFS_RPTA_DIR, exist_ok=True)
     destino = os.path.join(SFS_RPTA_DIR, f"R{ruc}-{tipo}-{numeracion}.zip")

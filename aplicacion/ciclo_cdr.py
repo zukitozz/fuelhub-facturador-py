@@ -12,11 +12,19 @@ import integraciones
 from config import (
     SFS_RPTA_DIR, DIR_PROCESADOS, DIR_ERRORES, MAX_REINTENTOS_RECHAZO,
     _MAX_ERRORS_SQL, _CDR_ACEPTADOS, NOTIFICADOR_COMPROBANTES, EMISOR_RUC_OVERRIDE,
+    _RESUMENES_PATH, MINUTOS_CDR_VACIO, _MAX_DES_OBSE,
 )
-from dominio.cdr import _TIPO_RC, _reconciliar_numeracion, _datos_del_nombre_cdr, parsear_xml_cdr
-from utilidades_files import _archivo_estable, _mover
+from dominio.cdr import (
+    _TIPO_RC, _reconciliar_numeracion, _datos_del_nombre_cdr, parsear_xml_cdr,
+    _veredicto_cdr,
+)
+from utilidades_files import _archivo_estable, _archivo_abandonado, _mover
 from aplicacion.bd_app import conectar_bd, _bd, _escribir_bd
 from estado.resumenes import _boletas_de_resumen
+from estado.resumenes import (
+    _resumen_descartado, _boletas_desde_firma, _resumenes_que_repiten,
+    _marcar_resumen_cerrado,
+)
 from estado.reintentos import _contar_reintento, _limpiar_reintento, _limpiar_reintentos
 from sfs.bd import _cerrar_documento_en_sfs, _cerrar_resumen_en_sfs
 
@@ -65,8 +73,8 @@ def _procesar_lineas_de_resumen(conn, numeracion_rc: str, boletas: list, parsed:
     está.
 
     Las excluidas no se pierden: quedan en enviado=0 con el motivo guardado, y
-    vuelven a proponerse en un resumen futuro (aplicacion.lecturas.obtener_boletas_para_resumen)
-    hasta agotar MAX_REINTENTOS_RECHAZO.
+    vuelven a proponerse en un resumen futuro (obtener_boletas_para_resumen) hasta
+    agotar MAX_REINTENTOS_RECHAZO.
     """
     incluidas = set(boletas)
     codigos = {
@@ -127,12 +135,40 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
         # cierre es un fan-out a todas las que se guardaron en resumenes.json cuando
         # se generó, no un UPDATE de una sola fila.
         boletas = _boletas_de_resumen(numeracion)
+        descartado = _resumen_descartado(numeracion)
+        if not boletas:
+            # Antes de darse por vencido, reconstruir desde el XML firmado: las
+            # entradas que borró la versión anterior de _olvidar_resumen() ya no están,
+            # y sus CDR tardíos tienen que poder cerrar sus boletas igual.
+            boletas = _boletas_desde_firma(EMISOR_RUC_OVERRIDE, numeracion)
+            if boletas:
+                logger.warning(
+                    "El resumen %s no figura en %s; sus %d boleta(s) se reconstruyeron "
+                    "desde el XML firmado en FIRMA/.",
+                    numeracion, os.path.basename(_RESUMENES_PATH), len(boletas),
+                )
         if not boletas:
             logger.error(
                 "CDR aceptado del resumen %s pero no hay boletas registradas para él "
-                "en resumenes.json; quedan en enviado=0.", numeracion,
+                "en %s ni se pudo reconstruir desde FIRMA/; quedan en enviado=0.",
+                numeracion, os.path.basename(_RESUMENES_PATH),
             )
             return False
+
+        if descartado:
+            # SUNAT sí lo había recibido: se lo descartó dando por hecho que no, porque
+            # el envío falló sin devolver ticket. Ahora hay que avisarlo fuerte, porque
+            # si esas boletas ya viajaron en otro resumen aceptado están declaradas dos
+            # veces ante SUNAT y eso solo se deshace con una comunicación de baja.
+            repiten = _resumenes_que_repiten(numeracion, boletas)
+            logger.error(
+                "El resumen %s se había descartado el %s por no obtener ticket, pero "
+                "SUNAT lo aceptó: sus %d boleta(s) se cierran igual.%s",
+                numeracion, descartado, len(boletas),
+                (" ATENCIÓN: esas boletas también se declararon en %s, así que hay un "
+                 "duplicado ante SUNAT que requiere comunicación de baja."
+                 % ", ".join(repiten)) if repiten else "",
+            )
 
         # Separa las que SUNAT registró de verdad (limpias) de las que su propia
         # línea vino con código — esas NO se marcan enviado=1 aunque el resumen
@@ -148,10 +184,14 @@ def _actualizar_sql_cdr(conn, numeracion: str, parsed: dict) -> bool:
 
         _limpiar_reintento(numeracion)
         _limpiar_reintentos(limpias)
+        # Deja constancia de que este resumen ya cerró: es lo que distingue una entrada
+        # terminada de una a medias cuando su fila del SFS ya se limpió, y sin eso la
+        # poda no sabría cuál puede sacar del archivo.
+        _marcar_resumen_cerrado(numeracion, boletas)
         # Recién ahora el resumen esta terminado de verdad: sus boletas limpias ya
         # quedaron cerradas. Marcarlo antes liberaba las boletas mientras todavia
         # figuraban pendientes, y se generaba otro resumen con ellas.
-        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
+        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion, _veredicto_cdr(parsed))
         logger.info(
             "Resumen %s aceptado: %d boleta(s) marcadas enviado=1%s.",
             numeracion, filas,
@@ -198,8 +238,10 @@ def _registrar_error_cdr(conn, numeracion: str, parsed: dict) -> bool:
                              detalle[:_MAX_ERRORS_SQL])
         # Aunque haya sido rechazado, el ticket ya se consumio: dejarlo abierto
         # haria que se lo siguiera consultando en vano en cada ciclo. El motivo
-        # del rechazo queda en Factura.errors, que es donde se consulta.
-        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion)
+        # del rechazo queda en Factura.errors, que es donde se consulta —y tambien
+        # en la bandeja del SFS, que es lo primero que alguien mira: este es
+        # justamente el camino que rotulaba "Aceptado" un resumen rechazado.
+        _cerrar_resumen_en_sfs(EMISOR_RUC_OVERRIDE, numeracion, _veredicto_cdr(parsed))
         return filas > 0
 
     filas = _escribir_bd(_bd().guardar_error, conn, numeracion,
@@ -238,6 +280,18 @@ def _barrer_rpta():
             nombre = os.path.basename(ruta)
             try:
                 if not _archivo_estable(ruta):
+                    # Un archivo vacío que ya no va a completarse no puede quedarse en
+                    # RPTA: además de repetir este aviso para siempre, le hace creer a
+                    # _tiene_cdr() que el CDR ya está y bloquea la reconsulta a SUNAT.
+                    if _archivo_abandonado(ruta):
+                        logger.warning(
+                            "CDR %s lleva más de %d min en 0 bytes; quedó a medio escribir. "
+                            "Se aparta en errores/ para que se pueda volver a consultar a SUNAT.",
+                            nombre, MINUTOS_CDR_VACIO,
+                        )
+                        _mover(ruta, DIR_ERRORES)
+                        err += 1
+                        continue
                     # Lo retoma el barrido periódico de hilo_cdr; no cuenta como error.
                     logger.info("CDR %s aún se está escribiendo; se retoma luego.", nombre)
                     continue

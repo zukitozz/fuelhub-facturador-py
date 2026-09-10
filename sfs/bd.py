@@ -6,7 +6,9 @@ lleva de cada documento, sin tocar el motor de la aplicación (ver repositorio/)
 import logging
 import os
 import sqlite3
+import xml.etree.ElementTree as ET
 import time
+import zipfile
 from contextlib import closing, contextmanager
 from datetime import datetime
 
@@ -14,9 +16,10 @@ from config import (
     SFS_BD_PATH, SFS_DATA_DIR, SFS_RPTA_DIR, DIR_PROCESADOS,
     _EXT_DATA, _EXT_DATA_SFS, _ESTADOS_CERRADOS, _ESTADOS_ERROR,
     _ESPERA_XML_SEG, _TIPOS_SFS,
+    _ESTADOS_RESUMEN_ABIERTO, _MAX_DES_OBSE,
 )
 from dominio.texto import _texto, _marcas
-from dominio.cdr import _TIPO_RC
+from dominio.cdr import _TIPO_RC, _veredicto_cdr, parsear_xml_cdr
 from utilidades_files import _borrar_si_existe
 
 logger = logging.getLogger(__name__)
@@ -54,18 +57,35 @@ def _xml_generado(ruc: str, tip: str, num: str) -> bool:
 
 
 def _resumenes_con_ticket(ruc_emisor: str) -> list:
-    """[(num_docu, ticket)] de los resúmenes enviados que esperan respuesta."""
+    """
+    [(num_docu, ticket)] de los resúmenes que todavía pueden resolverse por su ticket.
+
+    Se pide que el resumen NO esté cerrado y que conserve ticket, en vez de exigir
+    los estados '08'/'09' como antes. El motivo: si la consulta del ticket falla
+    —SUNAT devolviendo "Internal Error", por ejemplo— el SFS deja el resumen en '05',
+    y con el filtro viejo eso lo sacaba de esta lista para siempre. El ticket seguía
+    guardado y seguía siendo válido, pero nadie volvía a usarlo.
+
+    Eso paso en produccion el 2026-09-06: siete resumenes quedaron en '05' por una
+    falla pasajera de SUNAT y retuvieron 1239 boletas durante 12 horas, cuando los
+    siete tickets respondian "aceptado" al consultarlos a mano.
+
+    Un ticket ya consumido tambien entra acá, y esta bien: SUNAT contesta 0127 y de
+    eso se encarga recuperar_cdr_resumenes(), que lo distingue de una consulta que
+    fallo y merece otro intento.
+    """
     if not os.path.exists(SFS_BD_PATH):
         return []
+    marcas = _marcas(len(_ESTADOS_RESUMEN_ABIERTO))
     try:
         with _sfs_bd() as sfs:
             return [
                 (_texto(num), _texto(tk))
                 for num, tk in sfs.execute(
-                    "SELECT NUM_DOCU, NUM_TICKET FROM DOCUMENTO "
-                    "WHERE NUM_RUC=? AND TIP_DOCU=? AND IND_SITU IN ('08','09') "
-                    "AND NUM_TICKET IS NOT NULL AND NUM_TICKET <> ''",
-                    (ruc_emisor, _TIPO_RC),
+                    f"SELECT NUM_DOCU, NUM_TICKET FROM DOCUMENTO "
+                    f"WHERE NUM_RUC=? AND TIP_DOCU=? AND IND_SITU IN ({marcas}) "
+                    f"AND NUM_TICKET IS NOT NULL AND NUM_TICKET <> ''",
+                    (ruc_emisor, _TIPO_RC, *_ESTADOS_RESUMEN_ABIERTO),
                 )
             ]
     except sqlite3.Error:
@@ -73,7 +93,7 @@ def _resumenes_con_ticket(ruc_emisor: str) -> list:
         return []
 
 
-def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str):
+def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str, veredicto: str = ""):
     """
     Da por cerrado el resumen en la bandeja del SFS una vez que su CDR está en RPTA.
 
@@ -83,20 +103,33 @@ def _cerrar_resumen_en_sfs(ruc_emisor: str, numeracion: str):
     se reportaría como trabado en cada ciclo y sus archivos nunca saldrían de DATA
     —pese a estar perfectamente emitido y con las boletas ya cerradas—.
 
-    Se marca '03' con el mismo criterio que usa aplicacion/ciclo_generacion.py
-    (_activar_pendientes_sfs_bd) cuando encuentra un CDR ya descargado: en la
-    bandeja del SFS ese estado significa "ya no me ocupo de esto". El veredicto
-    real de SUNAT no vive acá sino en el CDR, que es quien decide si las boletas
-    quedan en enviado=true o con su motivo de rechazo.
+    Se marca '03' con el mismo criterio que usa _activar_pendientes_sfs_bd() cuando
+    encuentra un CDR ya descargado: en la bandeja del SFS ese estado significa "ya
+    no me ocupo de esto". El veredicto real de SUNAT no vive acá sino en el CDR, que
+    es quien decide si las boletas quedan en enviado=true o con su motivo de rechazo.
+
+    El WHERE sale de _ESTADOS_RESUMEN_ABIERTO, la misma constante que decide a cuáles
+    consultarles el ticket. Antes exigía '08'/'09' escrito a mano y quedó atrás
+    cuando la consulta se amplió para rescatar los resúmenes en '05': el rescate
+    funcionaba, pero el cierre no encontraba la fila, el UPDATE afectaba cero filas y
+    el resumen se quedaba en '05' para siempre —reconsultándose y reportándose como
+    trabado aunque sus boletas ya estuvieran cerradas.
     """
     if not os.path.exists(SFS_BD_PATH):
         return
+    # El '03' es el mismo para un aceptado y para un rechazado —significa "ya no me
+    # ocupo de esto"—, así que el único lugar donde se puede leer qué contestó SUNAT
+    # es este texto. Quien llama pasa el veredicto que ya tiene; si no lo tiene, se lo
+    # lee del CDR archivado en vez de suponerlo.
+    obse = veredicto or _veredicto_archivado(ruc_emisor, _TIPO_RC, numeracion)
     try:
         with _sfs_bd(escritura=True) as sfs:
             sfs.execute(
-                "UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE='Aceptado (CDR procesado)' "
-                "WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? AND IND_SITU IN ('08','09')",
-                (ruc_emisor, _TIPO_RC, numeracion),
+                f"UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE=? "
+                f"WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
+                f"AND IND_SITU IN ({_marcas(len(_ESTADOS_RESUMEN_ABIERTO))})",
+                (obse[:_MAX_DES_OBSE], ruc_emisor, _TIPO_RC, numeracion,
+                 *_ESTADOS_RESUMEN_ABIERTO),
             )
     except sqlite3.Error:
         logger.exception("No se pudo cerrar el resumen %s en la bandeja del SFS.", numeracion)
@@ -127,8 +160,24 @@ def _registrar_en_sfs_bd(ruc_emisor: str, docs: list):
 
 
 def _tiene_cdr(ruc: str, tip: str, num: str) -> bool:
+    """
+    True si el CDR de este comprobante ya está en disco.
+
+    Se exige que el archivo tenga contenido, no solo que exista: un ZIP que quedó en
+    0 bytes hacía que recuperar_cdr_pendientes() diera el CDR por recuperado y no
+    volviera a consultarle a SUNAT, mientras el barrido tampoco podía procesarlo. El
+    comprobante quedaba en enviado=0 sin ninguna via de salida (ver
+    _archivo_abandonado).
+    """
     nombre = f"R{ruc}-{tip}-{num}.zip"
-    return any(os.path.exists(os.path.join(d, nombre)) for d in (SFS_RPTA_DIR, DIR_PROCESADOS))
+    for d in (SFS_RPTA_DIR, DIR_PROCESADOS):
+        ruta = os.path.join(d, nombre)
+        try:
+            if os.path.getsize(ruta) > 0:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _eliminar_data_files(nom_arch: str):
@@ -179,8 +228,8 @@ def _docs_enviados_sin_cdr(ruc_emisor: str) -> list:
     fecha de envío es que nunca salieron, y preguntar por ellos no tiene sentido.
 
     Los resúmenes (RC) quedan afuera: su respuesta vive detrás de un ticket y se
-    consulta con getStatus, no con getStatusCdr (ver aplicacion/recuperacion_cdr.py).
-    Si entraran acá, se les preguntaría con una serie-número que no existe como tal, y
+    consulta con getStatus, no con getStatusCdr (ver recuperar_cdr_resumenes). Si
+    entraran acá, se les preguntaría con una serie-número que no existe como tal, y
     una respuesta de "no registrado" borraría el resumen de la bandeja junto con su
     ticket — perdiendo el único modo de recuperar su CDR.
     """
@@ -238,13 +287,12 @@ def _cerrar_documento_en_sfs(ruc: str, tipo: str, numeracion: str):
     Da por enviado y aceptado un documento en la bandeja del SFS.
 
     Solo hace falta cuando el CDR no llegó por el camino del SFS sino que lo bajó
-    el daemon de SUNAT (ver sunat/consulta.py: _guardar_cdr): en ese caso la fila
-    queda como la dejó el error de red, en IND_SITU='06' y con FEC_ENVI vacía. Sin
-    esto pasaban dos cosas, las dos vistas en producción el 2026-09-03:
-    resetear_rechazados() volvía a levantar la fila en el ciclo siguiente
-    —consultaba a SUNAT otra vez, bajaba el mismo CDR, y así cada 60 segundos
-    durante casi cuatro horas—, y la bandeja mostraba el comprobante como "Con
-    Errores" pese a estar aceptado en SUNAT.
+    el daemon de SUNAT (ver _guardar_cdr): en ese caso la fila queda como la dejó
+    el error de red, en IND_SITU='06' y con FEC_ENVI vacía. Sin esto pasaban dos
+    cosas, las dos vistas en producción el 2026-09-03: resetear_rechazados() volvía
+    a levantar la fila en el ciclo siguiente —consultaba a SUNAT otra vez, bajaba
+    el mismo CDR, y así cada 60 segundos durante casi cuatro horas—, y la bandeja
+    mostraba el comprobante como "Con Errores" pese a estar aceptado en SUNAT.
 
     El WHERE filtra por los estados de error a propósito: si la fila ya está
     cerrada, el UPDATE no afecta ninguna y el segundo pase del mismo CDR —watchdog
@@ -266,3 +314,68 @@ def _cerrar_documento_en_sfs(ruc: str, tipo: str, numeracion: str):
             "No se pudo cerrar %s-%s en la bandeja del SFS; el comprobante quedó "
             "bien cerrado en la BD igual.", tipo, numeracion,
         )
+
+
+def _ticket_de_resumen(ruc_emisor: str, numeracion: str) -> str:
+    """
+    Ticket guardado de un resumen, o "" si no tiene.
+
+    Sirve como evidencia de si SUNAT llegó a recibirlo: el ticket lo escribe el SFS
+    con lo que devuelve sendSummary, así que sin ticket el envío no llegó. Es lo que
+    permite decidir si un resumen trabado se puede volver a armar sin arriesgar
+    declarar las mismas boletas dos veces.
+    """
+    if not os.path.exists(SFS_BD_PATH):
+        return ""
+    try:
+        with _sfs_bd() as sfs:
+            fila = sfs.execute(
+                "SELECT NUM_TICKET FROM DOCUMENTO "
+                "WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=?",
+                (ruc_emisor, _TIPO_RC, numeracion),
+            ).fetchone()
+    except sqlite3.Error:
+        # Ante la duda se responde "tiene ticket": eso frena el reenvío, que es el
+        # lado seguro. Decir que no tiene habilitaría a declarar de nuevo algo que
+        # quizá SUNAT ya recibió.
+        logger.exception("No se pudo leer el ticket del resumen %s.", numeracion)
+        return "desconocido"
+    return _texto(fila[0]) if fila else ""
+
+
+def _cdr_ya_procesado(ruc: str, tip: str, num: str) -> bool:
+    """
+    True si el CDR ya paso por el hilo CDR y quedo archivado.
+
+    La distincion con _tiene_cdr() importa: que el archivo este en RPTA solo dice
+    que se bajo, no que se haya repartido entre las boletas. Recien cuando el
+    barrido lo procesa sin errores lo mueve a procesados/, y esa mudanza es la
+    unica evidencia de que el CDR ya hizo su trabajo.
+    """
+    ruta = os.path.join(DIR_PROCESADOS, f"R{ruc}-{tip}-{num}.zip")
+    try:
+        return os.path.getsize(ruta) > 0
+    except OSError:
+        return False
+
+
+def _veredicto_archivado(ruc: str, tip: str, num: str) -> str:
+    """
+    Veredicto leído del CDR que ya está en disco, para cerrar sin tener que afirmarlo.
+
+    Hace falta donde se cierra un documento por el solo hecho de que su CDR existe
+    —ver _activar_pendientes_sfs_bd() y el rescate de recuperar_cdr_resumenes()—: ahí
+    no hay un `parsed` a mano, y suponer "aceptado" es exactamente lo que hacía mentir
+    a la bandeja. Si el archivo no se puede leer, el texto lo dice en vez de inventar
+    un veredicto.
+    """
+    for carpeta in (DIR_PROCESADOS, SFS_RPTA_DIR):
+        ruta = os.path.join(carpeta, f"R{ruc}-{tip}-{num}.zip")
+        try:
+            with zipfile.ZipFile(ruta) as z:
+                xmls = [n for n in z.namelist() if n.lower().endswith(".xml")]
+                if xmls:
+                    return _veredicto_cdr(parsear_xml_cdr(z.read(xmls[0])))
+        except (OSError, zipfile.BadZipFile, ET.ParseError):
+            continue
+    return "CDR procesado; ver el CDR archivado"
