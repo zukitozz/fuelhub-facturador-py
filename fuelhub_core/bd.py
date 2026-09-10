@@ -1,11 +1,14 @@
 """
-Consultas a la BD de la aplicación (AUXILIAR, SQL Server) para los cierres de
-turno y de día que se envían a FuelHub core.
+Consultas a la BD de la aplicación (AUXILIAR, SQL Server) para lo que se envía
+a FuelHub core: los cierres de turno y de día, y el PDF de los comprobantes
+(pdf_bytes/pdf_enviado).
 
 Específico de ese esquema —no pasa por repositorio/— porque Cierreturnos y
-Cierredias solo existen en instalaciones de grifo con SQL Server; el resto de
-la aplicación (Comprobantes) sí es multi-motor. Ver aplicacion/ciclo_cierres.py,
-que primero comprueba el motor antes de llamar a este módulo.
+Cierredias, y las columnas pdf_bytes/pdf_enviado de Comprobantes, solo existen
+en instalaciones de grifo con SQL Server; el resto de la aplicación
+(Comprobantes en su forma multi-motor) sí pasa por repositorio/. Ver
+aplicacion/ciclo_cierres.py y aplicacion/ciclo_pdf.py, que primero comprueban
+el motor antes de llamar a este módulo.
 """
 import logging
 from contextlib import closing
@@ -58,6 +61,17 @@ SELECT cd.id,
   FROM Cierredias cd
  WHERE (cd.enviado = 0 OR cd.enviado IS NULL)
  ORDER BY cd.id
+"""
+
+# pdf_bytes IS NOT NULL: la aplicación todavía no generó el PDF de muchos
+# comprobantes en cualquier momento dado, y eso no es un error que haya que
+# reportar acá —simplemente no hay nada que subir todavía.
+_SQL_PENDIENTES_PDF = """
+SELECT id, numeracion_comprobante, pdf_bytes
+  FROM Comprobantes
+ WHERE pdf_bytes IS NOT NULL
+   AND (pdf_enviado = 0 OR pdf_enviado IS NULL)
+ ORDER BY id
 """
 
 
@@ -120,3 +134,11 @@ def marcar_enviado_cierreturno(conn, cierreturno_id):
 
 def marcar_enviado_cierredia(conn, cierredia_id):
     _escribir(conn, "UPDATE Cierredias SET enviado=1 WHERE id=?", (cierredia_id,))
+
+
+def pendientes_pdf(conn) -> list:
+    return _filas(conn, _SQL_PENDIENTES_PDF)
+
+
+def marcar_pdf_enviado(conn, comprobante_id):
+    _escribir(conn, "UPDATE Comprobantes SET pdf_enviado=1 WHERE id=?", (comprobante_id,))

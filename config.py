@@ -380,6 +380,14 @@ FUELHUB_CORE_TOKEN_URL = os.getenv(
 FUELHUB_CORE_CLIENT_ID     = os.getenv("FUELHUB_CORE_CLIENT_ID", "").strip()
 FUELHUB_CORE_CLIENT_SECRET = os.getenv("FUELHUB_CORE_CLIENT_SECRET", "").strip()
 
+# Envío a FuelHub core del PDF de comprobantes (Comprobantes.pdf_bytes /
+# pdf_enviado, ver fuelhub_core/bd.py y aplicacion/ciclo_pdf.py) para que la
+# página web de consulta lo sirva desde S3 — mismas credenciales
+# FUELHUB_CORE_CLIENT_ID/SECRET que los cierres, sin ninguna credencial de AWS
+# en esta PC. Solo existe en instalaciones de grifo con SQL Server, igual que
+# Cierreturnos/Cierredias.
+INTERVALO_PDF_SEG = int(os.getenv("INTERVALO_PDF_SEG", "60"))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
