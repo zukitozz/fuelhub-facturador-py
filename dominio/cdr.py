@@ -177,3 +177,32 @@ def parsear_xml_cdr(fuente) -> dict:
         logger.exception("Error parseando CDR %s", fuente if isinstance(fuente, str) else "<bytes>")
         res["status"] = "ERROR"
     return res
+
+
+def _veredicto_cdr(parsed: dict, largo_max: int = None) -> str:
+    """
+    Lo que SUNAT contestó, en una línea, para DES_OBSE de la bandeja del SFS.
+
+    Ese campo es lo primero que mira una persona cuando algo sale mal, así que tiene
+    que decir la verdad. Hasta el 2026-09-09 se escribía un "Aceptado (CDR procesado)"
+    fijo, también cuando el CDR era un rechazo: quedaron 40 resúmenes rotulados
+    "Aceptado" de los cuales 39 SUNAT los había rechazado —34 con el código 2282,
+    "Existe documento ya informado anteriormente"—.
+
+    No hubo daño funcional: sus boletas siguieron en enviado=0, que es lo correcto. El
+    daño fue de diagnóstico. Ese texto llevó a concluir que había 143 boletas
+    declaradas 40 veces y que hacía falta una comunicación de baja ante SUNAT, cuando
+    en realidad SUNAT había rechazado los repetidos y no había ningún duplicado. La
+    conclusión correcta recién apareció al abrir los CDR archivados a mano.
+    """
+    estado = _texto(parsed.get("status")) or "PROCESADO"
+    texto = estado.capitalize()
+    codigo = _texto(parsed.get("codigo"))
+    if codigo:
+        texto += f" — código {codigo}"
+    descripcion = _texto(parsed.get("descripcion"))
+    if descripcion:
+        texto += f": {descripcion}"
+    # El recorte lo pide quien escribe, no el dominio: el ancho es de la columna
+    # DES_OBSE del SFS (_MAX_DES_OBSE), y esta capa no conoce esa tabla.
+    return texto[:largo_max] if largo_max else texto

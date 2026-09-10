@@ -9,12 +9,14 @@ patrón que usa sunat/consulta.py para recuperar CDR perdidos.
 """
 import base64
 import binascii
+import re
 import logging
 import urllib.error
 import urllib.request
 
 from config import SOL_USUARIO, SOL_CLAVE, SFS_CONSTANTES_PATH
 from dominio.cdr import _texto_de_nodo
+from dominio.texto import _texto
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +71,15 @@ def consultar_ticket_sunat(ruc: str, ticket: str):
     """
     Pregunta a SUNAT por el resultado de un ticket de resumen.
 
-    Devuelve (codigo, mensaje, cdr_zip). Ante cualquier fallo devuelve
-    (None, motivo, None) y quien llama debe tratarlo como "todavía no sé": el
-    resumen queda como está y se vuelve a consultar en el próximo ciclo.
+    Devuelve (codigo, mensaje, cdr_zip). Un None en el código significa "todavía no
+    sé" —falla de transporte, credenciales, servicio caído— y quien llama debe
+    reintentar más tarde.
+
+    Cuando SUNAT rechaza con un fault codificado, ese código SÍ vuelve: es la única
+    forma de distinguir un ticket que ya se consumió (0127, definitivo) de un
+    "Internal Error" pasajero. Aplastar los dos en None hacía que un resumen trabado
+    se reintentara para siempre o no se reintentara nunca, según de qué lado se
+    errara.
     """
     if not (SOL_USUARIO and SOL_CLAVE):
         return None, "faltan SOL_USUARIO y SOL_CLAVE en el .env", None
@@ -92,8 +100,9 @@ def consultar_ticket_sunat(ruc: str, ticket: str):
     except urllib.error.HTTPError as e:
         cuerpo = e.read().decode("utf-8", "replace")
         detalle = _texto_de_nodo(cuerpo, "faultstring") or f"HTTP {e.code}"
+        codigo_fault = _codigo_de_fault(cuerpo)
         logger.warning("Consulta del ticket %s rechazada por SUNAT: %s", ticket, detalle)
-        return None, detalle, None
+        return codigo_fault or None, detalle, None
     except Exception as e:
         logger.warning("No se pudo consultar el ticket %s: %s", ticket, e)
         return None, str(e), None
@@ -108,3 +117,37 @@ def consultar_ticket_sunat(ruc: str, ticket: str):
         except (ValueError, binascii.Error):
             logger.exception("SUNAT devolvió un CDR ilegible para el ticket %s", ticket)
     return codigo or None, mensaje, cdr
+
+
+def _norm_codigo_ticket(codigo) -> str:
+    """
+    El código de getStatus sin los ceros de la izquierda, para poder compararlo.
+
+    Existe porque SUNAT devuelve el mismo código en anchos distintos según la
+    respuesta ('0' contra '0098'), y comparar el texto crudo hacía fallar la
+    comparación justo en el caso más frecuente.
+
+    El '0' se conserva como '0' y no se convierte en cadena vacía: vacío significa
+    "SUNAT no dijo nada" —una falla de transporte— y cero significa "aceptado". Son
+    dos cosas opuestas y aplastarlas daría por bueno un envío que nunca respondió.
+    """
+    texto = _texto(codigo)
+    if not texto:
+        return ""
+    return texto.lstrip("0") or "0"
+
+
+def _codigo_de_fault(cuerpo: str) -> str:
+    """
+    Código de SUNAT dentro del faultcode de un error SOAP.
+
+    Viene pegado al espacio de nombres —"soap-env:Client.0127"— y es lo único que
+    distingue un rechazo con veredicto de una falla pasajera. Sin extraerlo, los dos
+    llegaban como None a quien llama y no habia forma de saber si convenia reintentar
+    o si SUNAT ya habia dicho la ultima palabra.
+    """
+    m = re.search(r"<(?:\w+:)?faultcode>(.*?)</(?:\w+:)?faultcode>", cuerpo, re.S)
+    if not m:
+        return ""
+    n = re.search(r"(\d{3,4})\s*$", m.group(1).strip())
+    return n.group(1) if n else ""

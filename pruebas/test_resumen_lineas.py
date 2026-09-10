@@ -26,7 +26,7 @@ class FakeBD:
     marcar_enviados = staticmethod(fake_marcar_enviados)
 ciclo_cdr._bd = lambda: FakeBD()
 ciclo_cdr._escribir_bd = lambda fn, conn, *a: fn(conn, *a)
-ciclo_cdr._cerrar_resumen_en_sfs = lambda ruc, num: None
+ciclo_cdr._cerrar_resumen_en_sfs = lambda ruc, num, veredicto="": None
 ciclo_cdr.EMISOR_RUC_OVERRIDE = "20609785269"
 
 def reset():
