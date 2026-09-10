@@ -1,12 +1,13 @@
 """
-Cliente HTTP de FuelHub core: token OAuth2 (client_credentials, Cognito) y el
-envío de los cierres de turno y de día.
+Cliente HTTP de FuelHub core: token OAuth2 (client_credentials, Cognito), el
+envío de los cierres de turno y de día, y la subida del PDF de comprobantes.
 """
 import json
 import logging
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from base64 import b64encode
@@ -57,7 +58,7 @@ def _token_vigente() -> str:
         return valor
 
 
-def _post(path: str, payload: dict, idempotency_key: str) -> bool:
+def _enviar(method: str, path: str, payload: dict, headers_extra: dict = None) -> bool:
     """True si FuelHub core aceptó el envío (2xx)."""
     try:
         token = _token_vigente()
@@ -65,15 +66,18 @@ def _post(path: str, payload: dict, idempotency_key: str) -> bool:
         logger.exception("No se pudo obtener el token de FuelHub core; se reintenta en el próximo ciclo.")
         return False
 
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    if headers_extra:
+        headers.update(headers_extra)
+
     peticion = urllib.request.Request(
         f"{FUELHUB_CORE_BASE_URL}/{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "Idempotency-Key": idempotency_key,
-        },
-        method="POST",
+        headers=headers,
+        method=method,
     )
     try:
         with urllib.request.urlopen(peticion, timeout=30) as r:
@@ -86,11 +90,15 @@ def _post(path: str, payload: dict, idempotency_key: str) -> bool:
             # próxima llamada pida uno nuevo en vez de repetir el mismo rechazo.
             with _lock_token:
                 _token["valor"] = None
-        logger.warning("FuelHub core rechazó %s (HTTP %s): %s", path, e.code, cuerpo[:500])
+        logger.warning("FuelHub core rechazó %s %s (HTTP %s): %s", method, path, e.code, cuerpo[:500])
         return False
     except Exception:
-        logger.exception("Error llamando a FuelHub core (%s)", path)
+        logger.exception("Error llamando a FuelHub core (%s %s)", method, path)
         return False
+
+
+def _post(path: str, payload: dict, idempotency_key: str) -> bool:
+    return _enviar("POST", path, payload, {"Idempotency-Key": idempotency_key})
 
 
 def enviar_cierre_turno(cierreturno_id, payload: dict) -> bool:
@@ -104,3 +112,21 @@ def enviar_cierre_turno(cierreturno_id, payload: dict) -> bool:
 def enviar_cierre_dia(cierredia_id, payload: dict) -> bool:
     clave = str(uuid.uuid5(uuid.NAMESPACE_URL, f"cierredia:{cierredia_id}"))
     return _post("v1/cierres-dia", payload, clave)
+
+
+def subir_pdf_comprobante(codigo_estacion: str, ruc: str, numeracion: str, pdf_bytes: bytes) -> bool:
+    """
+    PUT v1/comprobantes/{numeracion}/pdf — sube el PDF ya generado del
+    comprobante para que la página de consulta lo sirva desde S3 (ver
+    fuelhub-core: services/ingest-comprobante-pdf). Sin Idempotency-Key: a
+    diferencia de los cierres (un INSERT), acá el Lambda hace un PutObject a
+    una key fija (ruc/numeracion.pdf) — subir el mismo PDF dos veces pisa el
+    mismo objeto sin ningún efecto secundario.
+    """
+    ruta = f"v1/comprobantes/{urllib.parse.quote(numeracion, safe='')}/pdf"
+    payload = {
+        "codigoEstacion": codigo_estacion,
+        "ruc": ruc,
+        "contentBase64": b64encode(pdf_bytes).decode("ascii"),
+    }
+    return _enviar("PUT", ruta, payload)
