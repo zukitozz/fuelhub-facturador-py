@@ -90,7 +90,10 @@ def _enviar(method: str, path: str, payload: dict, headers_extra: dict = None) -
             # próxima llamada pida uno nuevo en vez de repetir el mismo rechazo.
             with _lock_token:
                 _token["valor"] = None
-        logger.warning("FuelHub core rechazó %s %s (HTTP %s): %s", method, path, e.code, cuerpo[:500])
+        logger.warning(
+            "FuelHub core rechazó %s %s (HTTP %s): %s | payload enviado: %s",
+            method, path, e.code, cuerpo[:500], json.dumps(payload, ensure_ascii=False)[:500],
+        )
         return False
     except Exception:
         logger.exception("Error llamando a FuelHub core (%s %s)", method, path)
