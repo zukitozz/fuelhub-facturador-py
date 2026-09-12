@@ -11,6 +11,7 @@ from aplicacion.bd_app import conectar_bd
 from fuelhub_core.bd import (
     pendientes_cierreturnos, detalle_cierreturno, pendientes_cierredias,
     codigo_estacion, admin_operador, marcar_enviado_cierreturno, marcar_enviado_cierredia,
+    uuids_cierreturno_de_dia,
 )
 from fuelhub_core.api import enviar_cierre_turno, enviar_cierre_dia
 
@@ -42,6 +43,7 @@ def _enviar_dias(conn, codigo: str, admin: dict) -> int:
             dia["codigo_estacion"] = codigo
             dia["admin_codigo"] = admin.get("codigo")
             dia["admin_nombre"] = admin.get("nombre")
+            dia["cierres_turno_ids"] = uuids_cierreturno_de_dia(conn, dia["id"])
             payload = payload_cierre_dia(dia)
             if enviar_cierre_dia(dia["id"], payload) is not None:
                 marcar_enviado_cierredia(conn, dia["id"])

@@ -63,6 +63,16 @@ SELECT cd.id,
  ORDER BY cd.id
 """
 
+# Solo los turnos ya aceptados por FuelHub core tienen uuid; uno todavía sin
+# enviar (o rechazado) no aporta un id porque ahí no existe.
+_SQL_TURNOS_UUID_DE_DIA = """
+SELECT uuid
+  FROM Cierreturnos
+ WHERE CierrediaId = ?
+   AND uuid IS NOT NULL
+ ORDER BY id
+"""
+
 # pdf_bytes IS NOT NULL: la aplicación todavía no generó el PDF de muchos
 # comprobantes en cualquier momento dado, y eso no es un error que haya que
 # reportar acá —simplemente no hay nada que subir todavía.
@@ -98,6 +108,10 @@ def detalle_cierreturno(conn, cierreturno_id) -> list:
 
 def pendientes_cierredias(conn) -> list:
     return _filas(conn, _SQL_PENDIENTES_DIA)
+
+
+def uuids_cierreturno_de_dia(conn, cierredia_id) -> list:
+    return [fila["uuid"] for fila in _filas(conn, _SQL_TURNOS_UUID_DE_DIA, (cierredia_id,))]
 
 
 def codigo_estacion(conn):
