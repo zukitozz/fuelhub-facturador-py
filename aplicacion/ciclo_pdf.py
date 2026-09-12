@@ -49,7 +49,7 @@ def ciclo_pdf():
             comprobante_id = fila["id"]
             numeracion = fila["numeracion_comprobante"]
             try:
-                if subir_pdf_comprobante(codigo, EMISOR_RUC_OVERRIDE, numeracion, bytes(fila["pdf_bytes"])):
+                if subir_pdf_comprobante(codigo, EMISOR_RUC_OVERRIDE, numeracion, bytes(fila["pdf_bytes"])) is not None:
                     marcar_pdf_enviado(conn, comprobante_id)
                     subidos += 1
             except Exception:

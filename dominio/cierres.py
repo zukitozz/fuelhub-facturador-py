@@ -73,4 +73,5 @@ def payload_cierre_dia(cabecera: dict) -> dict:
             "codigo": _texto(cabecera.get("admin_codigo")),
             "nombre": _texto(cabecera.get("admin_nombre")),
         },
+        "cierresTurnoIds": cabecera.get("cierres_turno_ids") or [],
     }

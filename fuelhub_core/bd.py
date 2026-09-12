@@ -63,6 +63,26 @@ SELECT cd.id,
  ORDER BY cd.id
 """
 
+# Solo los turnos ya aceptados por FuelHub core tienen uuid; uno todavía sin
+# enviar (o rechazado) no aporta un id porque ahí no existe.
+_SQL_TURNOS_UUID_DE_DIA = """
+SELECT uuid
+  FROM Cierreturnos
+ WHERE CierrediaId = ?
+   AND uuid IS NOT NULL
+ ORDER BY id
+"""
+
+# Cuántos turnos de ese día todavía no fueron confirmados por FuelHub core
+# (pendientes de enviar o rechazados): mientras haya alguno, el cierre de día
+# no se manda —iría con cierresTurnoIds incompleto.
+_SQL_TURNOS_SIN_CONFIRMAR_DE_DIA = """
+SELECT COUNT(*) AS pendientes
+  FROM Cierreturnos
+ WHERE CierrediaId = ?
+   AND uuid IS NULL
+"""
+
 # pdf_bytes IS NOT NULL: la aplicación todavía no generó el PDF de muchos
 # comprobantes en cualquier momento dado, y eso no es un error que haya que
 # reportar acá —simplemente no hay nada que subir todavía.
@@ -100,6 +120,14 @@ def pendientes_cierredias(conn) -> list:
     return _filas(conn, _SQL_PENDIENTES_DIA)
 
 
+def uuids_cierreturno_de_dia(conn, cierredia_id) -> list:
+    return [fila["uuid"] for fila in _filas(conn, _SQL_TURNOS_UUID_DE_DIA, (cierredia_id,))]
+
+
+def turnos_sin_confirmar_de_dia(conn, cierredia_id) -> int:
+    return _filas(conn, _SQL_TURNOS_SIN_CONFIRMAR_DE_DIA, (cierredia_id,))[0]["pendientes"]
+
+
 def codigo_estacion(conn):
     """El código de esta estación (Emisores.codigo). Hay una única fila."""
     filas = _filas(conn, "SELECT TOP 1 codigo FROM Emisores")
@@ -128,8 +156,9 @@ def admin_operador(conn) -> dict:
     return {"codigo": filas[0]["usuario"], "nombre": filas[0]["nombre"]}
 
 
-def marcar_enviado_cierreturno(conn, cierreturno_id):
-    _escribir(conn, "UPDATE Cierreturnos SET enviado=1 WHERE id=?", (cierreturno_id,))
+def marcar_enviado_cierreturno(conn, cierreturno_id, uuid_fuelhub: str):
+    """uuid_fuelhub es el "id" con que FuelHub core registró el cierre."""
+    _escribir(conn, "UPDATE Cierreturnos SET enviado=1, uuid=? WHERE id=?", (uuid_fuelhub, cierreturno_id))
 
 
 def marcar_enviado_cierredia(conn, cierredia_id):

@@ -11,6 +11,7 @@ from aplicacion.bd_app import conectar_bd
 from fuelhub_core.bd import (
     pendientes_cierreturnos, detalle_cierreturno, pendientes_cierredias,
     codigo_estacion, admin_operador, marcar_enviado_cierreturno, marcar_enviado_cierredia,
+    uuids_cierreturno_de_dia, turnos_sin_confirmar_de_dia,
 )
 from fuelhub_core.api import enviar_cierre_turno, enviar_cierre_dia
 
@@ -26,8 +27,9 @@ def _enviar_turnos(conn, codigo: str) -> int:
             turno["codigo_estacion"] = codigo
             detalle = detalle_cierreturno(conn, turno["id"])
             payload = payload_cierre_turno(turno, detalle)
-            if enviar_cierre_turno(turno["id"], payload):
-                marcar_enviado_cierreturno(conn, turno["id"])
+            respuesta = enviar_cierre_turno(turno["id"], payload)
+            if respuesta is not None:
+                marcar_enviado_cierreturno(conn, turno["id"], respuesta.get("id"))
                 enviados += 1
         except Exception:
             logger.exception("Error enviando cierre de turno %s", turno.get("id"))
@@ -38,11 +40,17 @@ def _enviar_dias(conn, codigo: str, admin: dict) -> int:
     enviados = 0
     for dia in pendientes_cierredias(conn):
         try:
+            if turnos_sin_confirmar_de_dia(conn, dia["id"]):
+                # Todavía hay turnos de este día sin confirmar en FuelHub core
+                # (pendientes o rechazados): se espera al próximo ciclo en vez
+                # de mandar el cierre de día con cierresTurnoIds incompleto.
+                continue
             dia["codigo_estacion"] = codigo
             dia["admin_codigo"] = admin.get("codigo")
             dia["admin_nombre"] = admin.get("nombre")
+            dia["cierres_turno_ids"] = uuids_cierreturno_de_dia(conn, dia["id"])
             payload = payload_cierre_dia(dia)
-            if enviar_cierre_dia(dia["id"], payload):
+            if enviar_cierre_dia(dia["id"], payload) is not None:
                 marcar_enviado_cierredia(conn, dia["id"])
                 enviados += 1
         except Exception:
