@@ -58,13 +58,13 @@ def _token_vigente() -> str:
         return valor
 
 
-def _enviar(method: str, path: str, payload: dict, headers_extra: dict = None) -> bool:
-    """True si FuelHub core aceptó el envío (2xx)."""
+def _enviar(method: str, path: str, payload: dict, headers_extra: dict = None) -> dict | None:
+    """Respuesta (dict) si FuelHub core aceptó el envío (2xx); None si no."""
     try:
         token = _token_vigente()
     except Exception:
         logger.exception("No se pudo obtener el token de FuelHub core; se reintenta en el próximo ciclo.")
-        return False
+        return None
 
     headers = {
         "Content-Type": "application/json",
@@ -81,8 +81,11 @@ def _enviar(method: str, path: str, payload: dict, headers_extra: dict = None) -
     )
     try:
         with urllib.request.urlopen(peticion, timeout=30) as r:
-            r.read()
-        return True
+            cuerpo = r.read()
+        try:
+            return json.loads(cuerpo) if cuerpo else {}
+        except json.JSONDecodeError:
+            return {}
     except urllib.error.HTTPError as e:
         cuerpo = e.read().decode("utf-8", "replace")
         if e.code == 401:
@@ -94,17 +97,19 @@ def _enviar(method: str, path: str, payload: dict, headers_extra: dict = None) -
             "FuelHub core rechazó %s %s (HTTP %s): %s | payload enviado: %s",
             method, path, e.code, cuerpo[:500], json.dumps(payload, ensure_ascii=False)[:500],
         )
-        return False
+        return None
     except Exception:
         logger.exception("Error llamando a FuelHub core (%s %s)", method, path)
-        return False
+        return None
 
 
-def _post(path: str, payload: dict, idempotency_key: str) -> bool:
+def _post(path: str, payload: dict, idempotency_key: str) -> dict | None:
     return _enviar("POST", path, payload, {"Idempotency-Key": idempotency_key})
 
 
-def enviar_cierre_turno(cierreturno_id, payload: dict) -> bool:
+def enviar_cierre_turno(cierreturno_id, payload: dict) -> dict | None:
+    """Respuesta de FuelHub core (incluye "id", el uuid con el que quedó
+    registrado el cierre) si lo aceptó; None si lo rechazó."""
     # Clave estable por fila: un reintento del mismo cierre —tras un timeout de
     # red, por ejemplo— reusa la misma clave, para que FuelHub core lo trate
     # como el mismo evento y no lo cuente dos veces.
@@ -112,12 +117,12 @@ def enviar_cierre_turno(cierreturno_id, payload: dict) -> bool:
     return _post("v1/cierres-turno", payload, clave)
 
 
-def enviar_cierre_dia(cierredia_id, payload: dict) -> bool:
+def enviar_cierre_dia(cierredia_id, payload: dict) -> dict | None:
     clave = str(uuid.uuid5(uuid.NAMESPACE_URL, f"cierredia:{cierredia_id}"))
     return _post("v1/cierres-dia", payload, clave)
 
 
-def subir_pdf_comprobante(codigo_estacion: str, ruc: str, numeracion: str, pdf_bytes: bytes) -> bool:
+def subir_pdf_comprobante(codigo_estacion: str, ruc: str, numeracion: str, pdf_bytes: bytes) -> dict | None:
     """
     PUT v1/comprobantes/{numeracion}/pdf — sube el PDF ya generado del
     comprobante para que la página de consulta lo sirva desde S3 (ver

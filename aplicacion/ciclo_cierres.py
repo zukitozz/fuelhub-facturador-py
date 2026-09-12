@@ -26,8 +26,9 @@ def _enviar_turnos(conn, codigo: str) -> int:
             turno["codigo_estacion"] = codigo
             detalle = detalle_cierreturno(conn, turno["id"])
             payload = payload_cierre_turno(turno, detalle)
-            if enviar_cierre_turno(turno["id"], payload):
-                marcar_enviado_cierreturno(conn, turno["id"])
+            respuesta = enviar_cierre_turno(turno["id"], payload)
+            if respuesta is not None:
+                marcar_enviado_cierreturno(conn, turno["id"], respuesta.get("id"))
                 enviados += 1
         except Exception:
             logger.exception("Error enviando cierre de turno %s", turno.get("id"))
@@ -42,7 +43,7 @@ def _enviar_dias(conn, codigo: str, admin: dict) -> int:
             dia["admin_codigo"] = admin.get("codigo")
             dia["admin_nombre"] = admin.get("nombre")
             payload = payload_cierre_dia(dia)
-            if enviar_cierre_dia(dia["id"], payload):
+            if enviar_cierre_dia(dia["id"], payload) is not None:
                 marcar_enviado_cierredia(conn, dia["id"])
                 enviados += 1
         except Exception:

@@ -128,8 +128,9 @@ def admin_operador(conn) -> dict:
     return {"codigo": filas[0]["usuario"], "nombre": filas[0]["nombre"]}
 
 
-def marcar_enviado_cierreturno(conn, cierreturno_id):
-    _escribir(conn, "UPDATE Cierreturnos SET enviado=1 WHERE id=?", (cierreturno_id,))
+def marcar_enviado_cierreturno(conn, cierreturno_id, uuid_fuelhub: str):
+    """uuid_fuelhub es el "id" con que FuelHub core registró el cierre."""
+    _escribir(conn, "UPDATE Cierreturnos SET enviado=1, uuid=? WHERE id=?", (uuid_fuelhub, cierreturno_id))
 
 
 def marcar_enviado_cierredia(conn, cierredia_id):
