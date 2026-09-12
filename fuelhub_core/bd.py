@@ -73,6 +73,16 @@ SELECT uuid
  ORDER BY id
 """
 
+# Cuántos turnos de ese día todavía no fueron confirmados por FuelHub core
+# (pendientes de enviar o rechazados): mientras haya alguno, el cierre de día
+# no se manda —iría con cierresTurnoIds incompleto.
+_SQL_TURNOS_SIN_CONFIRMAR_DE_DIA = """
+SELECT COUNT(*) AS pendientes
+  FROM Cierreturnos
+ WHERE CierrediaId = ?
+   AND uuid IS NULL
+"""
+
 # pdf_bytes IS NOT NULL: la aplicación todavía no generó el PDF de muchos
 # comprobantes en cualquier momento dado, y eso no es un error que haya que
 # reportar acá —simplemente no hay nada que subir todavía.
@@ -112,6 +122,10 @@ def pendientes_cierredias(conn) -> list:
 
 def uuids_cierreturno_de_dia(conn, cierredia_id) -> list:
     return [fila["uuid"] for fila in _filas(conn, _SQL_TURNOS_UUID_DE_DIA, (cierredia_id,))]
+
+
+def turnos_sin_confirmar_de_dia(conn, cierredia_id) -> int:
+    return _filas(conn, _SQL_TURNOS_SIN_CONFIRMAR_DE_DIA, (cierredia_id,))[0]["pendientes"]
 
 
 def codigo_estacion(conn):
