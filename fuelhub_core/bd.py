@@ -86,12 +86,18 @@ SELECT COUNT(*) AS pendientes
 # pdf_bytes IS NOT NULL: la aplicación todavía no generó el PDF de muchos
 # comprobantes en cualquier momento dado, y eso no es un error que haya que
 # reportar acá —simplemente no hay nada que subir todavía.
+# numero_documento = '0' es el receptor "Clientes Varios" (boleta sin DNI/RUC
+# capturado, ver repositorio/sqlserver.py:receptor); esos PDF no se suben. Se
+# deja la puerta abierta (LEFT JOIN) por si algún comprobante quedó sin
+# ReceptorId: ahí no se sabe que es "varios", así que no se lo excluye.
 _SQL_PENDIENTES_PDF = """
-SELECT id, numeracion_comprobante, pdf_bytes
-  FROM Comprobantes
- WHERE pdf_bytes IS NOT NULL
-   AND (pdf_enviado = 0 OR pdf_enviado IS NULL)
- ORDER BY id
+SELECT c.id, c.numeracion_comprobante, c.pdf_bytes
+  FROM Comprobantes c
+  LEFT JOIN Receptores r ON r.id = c.ReceptorId
+ WHERE c.pdf_bytes IS NOT NULL
+   AND (c.pdf_enviado = 0 OR c.pdf_enviado IS NULL)
+   AND (r.numero_documento IS NULL OR r.numero_documento <> '0')
+ ORDER BY c.id
 """
 
 
