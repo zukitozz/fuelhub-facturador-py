@@ -5,7 +5,7 @@ que la aplicación todavía no mandó (Cierreturnos/Cierredias.enviado = 0 o NUL
 import logging
 
 import repositorio
-from config import DATABASE_URL, FUELHUB_CORE_CLIENT_ID, FUELHUB_CORE_CLIENT_SECRET
+from config import CIERRE_DIA, DATABASE_URL,FUELHUB_CORE_CLIENT_ID, FUELHUB_CORE_CLIENT_SECRET
 from dominio.cierres import payload_cierre_turno, payload_cierre_dia
 from aplicacion.bd_app import conectar_bd
 from fuelhub_core.bd import (
@@ -49,7 +49,7 @@ def _enviar_dias(conn, codigo: str, admin: dict) -> int:
             dia["admin_codigo"] = admin.get("codigo")
             dia["admin_nombre"] = admin.get("nombre")
             dia["cierres_turno_ids"] = uuids_cierreturno_de_dia(conn, dia["id"])
-            payload = payload_cierre_dia(dia)
+            payload = payload_cierre_dia(dia, CIERRE_DIA)
             if enviar_cierre_dia(dia["id"], payload) is not None:
                 marcar_enviado_cierredia(conn, dia["id"])
                 enviados += 1
