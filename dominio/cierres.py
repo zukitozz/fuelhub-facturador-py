@@ -2,6 +2,8 @@
 Payloads de cierre de turno y cierre de día para FuelHub core: solo formato, sin
 tocar la BD ni la red — igual que comprobante.py y resumen_diario.py.
 """
+from datetime import date, timedelta
+
 from dominio.texto import _texto
 
 # (columna en Cierreturnos, medio que espera FuelHub core). Solo se declara un
@@ -62,11 +64,14 @@ def payload_cierre_turno(cabecera: dict, detalle: list) -> dict:
     }
 
 
-def payload_cierre_dia(cabecera: dict) -> dict:
+def payload_cierre_dia(cabecera: dict, dias_extra: int = 0) -> dict:
     fecha = _texto(cabecera.get("fecha"))
+    fecha_negocio = fecha[:10]
+    if dias_extra and fecha_negocio:
+        fecha_negocio = (date.fromisoformat(fecha_negocio) + timedelta(days=dias_extra)).isoformat()
     return {
         "codigoEstacion": cabecera.get("codigo_estacion"),
-        "fechaNegocio":   fecha[:10],
+        "fechaNegocio":   fecha_negocio,
         "fecha":          cabecera.get("fecha"),
         "total":          _num(cabecera.get("total")),
         "administrador": {

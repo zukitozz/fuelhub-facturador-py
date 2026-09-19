@@ -198,6 +198,9 @@ MOTIVO_NOTA_POR_DEFECTO = os.getenv("MOTIVO_NOTA_POR_DEFECTO", "").strip()
 # El max(1, ...) no es paranoia: con un 0 en el .env el resumen salia vacio, y con
 # un negativo descartaba boletas en silencio.
 MAX_BOLETAS_RESUMEN = max(1, min(int(os.getenv("MAX_BOLETAS_RESUMEN", "200")), 500))
+# Días que se suman a la fechaNegocio del cierre de día que se envía a FuelHub core.
+# Sin la variable no se corre ninguna fecha.
+CIERRE_DIA = int(os.getenv("CIERRE_DIA", "0") or "0")
 
 # Frenos contra el bucle de redeclaración. Visto en produccion el 2026-09-09, tras un
 # bloqueo de SUNAT de ~19 horas: 84 resumenes en un dia —lo normal son 2— y 143 boletas
