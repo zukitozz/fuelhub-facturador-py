@@ -122,7 +122,10 @@ def enviar_cierre_dia(cierredia_id, payload: dict) -> dict | None:
     return _post("v1/cierres-dia", payload, clave)
 
 
-def subir_pdf_comprobante(codigo_estacion: str, ruc: str, numeracion: str, pdf_bytes: bytes) -> dict | None:
+def subir_pdf_comprobante(
+    codigo_estacion: str, ruc: str, numeracion: str, pdf_bytes: bytes,
+    numero_documento_receptor: str, fecha_emision: str,
+) -> dict | None:
     """
     PUT v1/comprobantes/{numeracion}/pdf — sube el PDF ya generado del
     comprobante para que la página de consulta lo sirva desde S3 (ver
@@ -130,11 +133,19 @@ def subir_pdf_comprobante(codigo_estacion: str, ruc: str, numeracion: str, pdf_b
     diferencia de los cierres (un INSERT), acá el Lambda hace un PutObject a
     una key fija (ruc/numeracion.pdf) — subir el mismo PDF dos veces pisa el
     mismo objeto sin ningún efecto secundario.
+
+    numero_documento_receptor y fecha_emision son REQUERIDOS por este
+    contrato (antes no se mandaban): sin ellos FuelHub core responde 400
+    PARAMETROS_INVALIDOS. fecha_emision debe ir en formato YYYY-MM-DD —es la
+    fecha real de emisión del comprobante, no la de esta subida— y de ahí sale
+    la key {yyyy}/{mm}/{dd} del lado de FuelHub core.
     """
     ruta = f"v1/comprobantes/{urllib.parse.quote(numeracion, safe='')}/pdf"
     payload = {
         "codigoEstacion": codigo_estacion,
         "ruc": ruc,
+        "numeroDocumentoReceptor": numero_documento_receptor,
         "contentBase64": b64encode(pdf_bytes).decode("ascii"),
+        "fechaEmision": fecha_emision,
     }
     return _enviar("PUT", ruta, payload)

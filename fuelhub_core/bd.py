@@ -87,16 +87,25 @@ SELECT COUNT(*) AS pendientes
 # comprobantes en cualquier momento dado, y eso no es un error que haya que
 # reportar acá —simplemente no hay nada que subir todavía.
 # numero_documento = '0' es el receptor "Clientes Varios" (boleta sin DNI/RUC
-# capturado, ver repositorio/sqlserver.py:receptor); esos PDF no se suben. Se
-# deja la puerta abierta (LEFT JOIN) por si algún comprobante quedó sin
-# ReceptorId: ahí no se sabe que es "varios", así que no se lo excluye.
+# capturado, ver repositorio/sqlserver.py:receptor); esos PDF no se suben.
+# numeroDocumentoReceptor y fechaEmision son REQUERIDOS por FuelHub core desde
+# el nuevo contrato de PUT v1/comprobantes/{numeracion}/pdf (antes no se
+# mandaban) — por eso ahora también se excluyen los comprobantes sin
+# ReceptorId o sin fecha_emision: antes esa fila "se dejaba pasar" porque esos
+# campos no iban en el payload, pero mandarla hoy sería un 400
+# PARAMETROS_INVALIDOS garantizado. Quedan pendientes (pdf_enviado sigue en 0)
+# hasta que el dato se complete.
 _SQL_PENDIENTES_PDF = """
-SELECT c.id, c.numeracion_comprobante, c.pdf_bytes
+SELECT c.id, c.numeracion_comprobante, c.pdf_bytes,
+       CONVERT(varchar, c.fecha_emision, 23) AS fecha_emision,
+       r.numero_documento                     AS numero_documento_receptor
   FROM Comprobantes c
   LEFT JOIN Receptores r ON r.id = c.ReceptorId
  WHERE c.pdf_bytes IS NOT NULL
    AND (c.pdf_enviado = 0 OR c.pdf_enviado IS NULL)
-   AND (r.numero_documento IS NULL OR r.numero_documento <> '0')
+   AND c.fecha_emision IS NOT NULL
+   AND r.numero_documento IS NOT NULL
+   AND r.numero_documento <> '0'
  ORDER BY c.id
 """
 
