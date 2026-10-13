@@ -18,6 +18,17 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_BASE, ".env"))
 
 # ---------------------------------------------------------------------------
+# Modo del daemon
+# ---------------------------------------------------------------------------
+# Algunas estaciones todavía no emiten comprobantes a SUNAT con este daemon
+# (siguen con su sistema anterior para eso) pero sí necesitan los jobs que
+# hablan con FuelHub core: cierres de turno/día, PDF de comprobantes, reporte
+# top-facturas (ver aplicacion/hilos.py y main.py). En falso, el daemon no
+# arranca los hilos Generador ni CDR —los que hablan con el SFS local—; el
+# resto sigue igual, gateado como siempre por sus propias credenciales/motor.
+FACTURACION_SUNAT_HABILITADA = os.getenv("FACTURACION_SUNAT_HABILITADA", "true").strip().lower() not in ("0", "false", "no")
+
+# ---------------------------------------------------------------------------
 # Intervalos
 # ---------------------------------------------------------------------------
 INTERVALO_GENERACION_SEG = int(os.getenv("INTERVALO_GENERACION_SEG", "60"))
