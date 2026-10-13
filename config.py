@@ -239,6 +239,11 @@ _RESUMENES_PATH = os.path.join(_BASE, "resumenes.json")
 # El contador vive en disco: en memoria, un reinicio de PM2 —que reinicia solo— haría
 # arrancar la cuenta de cero y el bucle volvería a ser infinito.
 _REINTENTOS_PATH = os.path.join(_BASE, "reintentos.json")
+# Qué semana de reporte top-facturas fue la última enviada a FuelHub core, y la
+# Idempotency-Key en curso para la semana que se está intentando mandar — en disco
+# por el mismo motivo que resumenes.json/reintentos.json: un reinicio de PM2 no
+# puede perder de vista qué clave ya se usó (ver aplicacion/ciclo_reporte_facturas.py).
+_REPORTE_FACTURAS_PATH = os.path.join(_BASE, "reporte_facturas.json")
 
 # Cuántos bloqueados se detallan en el log antes de resumir; son estables entre
 # ciclos y volcarlos todos cada 60s ahoga el resto del log.
@@ -390,6 +395,16 @@ FUELHUB_CORE_CLIENT_SECRET = os.getenv("FUELHUB_CORE_CLIENT_SECRET", "").strip()
 # en esta PC. Solo existe en instalaciones de grifo con SQL Server, igual que
 # Cierreturnos/Cierredias.
 INTERVALO_PDF_SEG = int(os.getenv("INTERVALO_PDF_SEG", "60"))
+
+# Reporte semanal antifraude (POST v1/reportes/top-facturas): el top de clientes
+# que más facturaron en la semana ya cerrada (lunes a domingo) y qué despachador
+# generó cada factura — ver aplicacion/ciclo_reporte_facturas.py. Sin apuro de
+# horario (a diferencia de cierres/pdf): un intervalo largo alcanza, el propio
+# ciclo decide solo si ya le toca mandar la semana o si ya la mandó.
+INTERVALO_REPORTE_FACTURAS_SEG = int(os.getenv("INTERVALO_REPORTE_FACTURAS_SEG", "3600"))
+# Tope de clientes que entran al reporte — fijo por contrato con FuelHub core, no
+# tiene sentido exponerlo como variable de entorno.
+TOP_FACTURAS_CANTIDAD = 20
 
 # ---------------------------------------------------------------------------
 # Logging

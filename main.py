@@ -12,7 +12,7 @@ import time
 from config import SFS_DATA_DIR, SFS_RPTA_DIR, DATABASE_URL
 from aplicacion.bd_app import _url_sin_clave
 from aplicacion.ciclo_cdr import procesar_respuestas
-from aplicacion.hilos import hilo_generador, hilo_cdr, hilo_cierres, hilo_pdf
+from aplicacion.hilos import hilo_generador, hilo_cdr, hilo_cierres, hilo_pdf, hilo_reporte_facturas
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ if __name__ == "__main__":
         threading.Thread(target=hilo_cdr,       name="CDR",       daemon=True),
         threading.Thread(target=hilo_cierres,   name="Cierres",   daemon=True),
         threading.Thread(target=hilo_pdf,       name="PDF",       daemon=True),
+        threading.Thread(target=hilo_reporte_facturas, name="Reporte", daemon=True),
     ]
     for t in hilos:
         t.start()

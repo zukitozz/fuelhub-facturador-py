@@ -125,6 +125,7 @@ def enviar_cierre_dia(cierredia_id, payload: dict) -> dict | None:
 def subir_pdf_comprobante(
     codigo_estacion: str, ruc: str, numeracion: str, pdf_bytes: bytes,
     numero_documento_receptor: str, fecha_emision: str,
+    xml_bytes: bytes = None, cdr_bytes: bytes = None,
 ) -> dict | None:
     """
     PUT v1/comprobantes/{numeracion}/pdf — sube el PDF ya generado del
@@ -139,6 +140,13 @@ def subir_pdf_comprobante(
     PARAMETROS_INVALIDOS. fecha_emision debe ir en formato YYYY-MM-DD —es la
     fecha real de emisión del comprobante, no la de esta subida— y de ahí sale
     la key {yyyy}/{mm}/{dd} del lado de FuelHub core.
+
+    xml_bytes/cdr_bytes son OPCIONALES (xmlBase64/cdrBase64 del contrato): si
+    no están disponibles todavía (CDR sin volver de SUNAT, por ejemplo) se
+    pasa None y quedan afuera del payload sin afectar la subida del PDF — ver
+    sfs/bd.py:leer_xml_firmado/leer_cdr_xml, que ya entregan el XML/CDR
+    extraído y listo (FuelHub core no desempaqueta el .zip del CDR, así que
+    acá nunca se manda el zip crudo).
     """
     ruta = f"v1/comprobantes/{urllib.parse.quote(numeracion, safe='')}/pdf"
     payload = {
@@ -148,4 +156,21 @@ def subir_pdf_comprobante(
         "contentBase64": b64encode(pdf_bytes).decode("ascii"),
         "fechaEmision": fecha_emision,
     }
+    if xml_bytes is not None:
+        payload["xmlBase64"] = b64encode(xml_bytes).decode("ascii")
+    if cdr_bytes is not None:
+        payload["cdrBase64"] = b64encode(cdr_bytes).decode("ascii")
     return _enviar("PUT", ruta, payload)
+
+
+def enviar_reporte_top_facturas(codigo_estacion: str, semana_inicio: str, top: list, idempotency_key: str) -> dict | None:
+    """
+    POST v1/reportes/top-facturas — reporte semanal antifraude: el top de
+    clientes que más facturaron esa semana y qué despachador generó cada
+    factura. A diferencia de subir_pdf_comprobante, SÍ exige Idempotency-Key
+    (mismo mecanismo que los cierres) — ver estado/reporte_facturas.py para por
+    qué esa clave se genera una sola vez por semana y se reutiliza en cada
+    reintento, nunca una nueva por llamada.
+    """
+    payload = {"codigoEstacion": codigo_estacion, "semanaInicio": semana_inicio, "top": top}
+    return _post("v1/reportes/top-facturas", payload, idempotency_key)

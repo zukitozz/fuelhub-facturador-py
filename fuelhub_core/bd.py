@@ -96,7 +96,7 @@ SELECT COUNT(*) AS pendientes
 # PARAMETROS_INVALIDOS garantizado. Quedan pendientes (pdf_enviado sigue en 0)
 # hasta que el dato se complete.
 _SQL_PENDIENTES_PDF = """
-SELECT c.id, c.numeracion_comprobante, c.pdf_bytes,
+SELECT c.id, c.numeracion_comprobante, c.pdf_bytes, c.tipo_comprobante,
        CONVERT(varchar, c.fecha_emision, 23) AS fecha_emision,
        r.numero_documento                     AS numero_documento_receptor
   FROM Comprobantes c
@@ -107,6 +107,35 @@ SELECT c.id, c.numeracion_comprobante, c.pdf_bytes,
    AND r.numero_documento IS NOT NULL
    AND r.numero_documento <> '0'
  ORDER BY c.id
+"""
+
+
+# Facturas (no boletas: tipo_comprobante='01') aceptadas por SUNAT (enviado=1)
+# dentro de la semana [desde, hasta) para el reporte antifraude top-facturas —
+# ver aplicacion/ciclo_reporte_facturas.py. JOIN (no LEFT JOIN) contra Receptores
+# y Usuarios a propósito: una factura sin receptor real o sin despachador
+# (UsuarioId) no tiene con qué completar numeroDocumentoCliente/despachador*, que
+# el contrato de FuelHub core no marca como opcionales — mejor excluirla del
+# reporte que mandar un payload que sabemos que va a rechazar. numero_documento
+# <> '0' excluye "Clientes Varios" (no debería darse en una factura real, pero
+# es el mismo criterio defensivo que ya usa _SQL_PENDIENTES_PDF).
+_SQL_FACTURAS_SEMANA = """
+SELECT r.numero_documento                     AS numero_documento_cliente,
+       r.razon_social                         AS nombre_cliente,
+       c.numeracion_comprobante                AS numeracion,
+       CONVERT(varchar, c.fecha_emision, 23)   AS fecha,
+       c.total,
+       u.nombre                                AS despachador_nombre,
+       u.usuario                               AS despachador_documento
+  FROM Comprobantes c
+  JOIN Receptores r ON r.id = c.ReceptorId
+  JOIN Usuarios   u ON u.id = c.UsuarioId
+ WHERE c.tipo_comprobante = '01'
+   AND c.enviado = 1
+   AND c.fecha_emision >= ? AND c.fecha_emision < ?
+   AND r.numero_documento IS NOT NULL
+   AND r.numero_documento <> '0'
+ ORDER BY c.fecha_emision
 """
 
 
@@ -186,3 +215,10 @@ def pendientes_pdf(conn) -> list:
 
 def marcar_pdf_enviado(conn, comprobante_id):
     _escribir(conn, "UPDATE Comprobantes SET pdf_enviado=1 WHERE id=?", (comprobante_id,))
+
+
+def facturas_semana(conn, desde_fecha: str, hasta_fecha: str) -> list:
+    """Filas de factura aceptada entre [desde_fecha, hasta_fecha) (strings
+    YYYY-MM-DD), una por factura — agrupar por cliente queda del lado de
+    aplicacion/ciclo_reporte_facturas.py, acá solo se trae el detalle crudo."""
+    return _filas(conn, _SQL_FACTURAS_SEMANA, (desde_fecha, hasta_fecha))
