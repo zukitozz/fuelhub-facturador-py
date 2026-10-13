@@ -96,7 +96,7 @@ SELECT COUNT(*) AS pendientes
 # PARAMETROS_INVALIDOS garantizado. Quedan pendientes (pdf_enviado sigue en 0)
 # hasta que el dato se complete.
 _SQL_PENDIENTES_PDF = """
-SELECT c.id, c.numeracion_comprobante, c.pdf_bytes,
+SELECT c.id, c.numeracion_comprobante, c.pdf_bytes, c.tipo_comprobante,
        CONVERT(varchar, c.fecha_emision, 23) AS fecha_emision,
        r.numero_documento                     AS numero_documento_receptor
   FROM Comprobantes c

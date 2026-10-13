@@ -13,13 +13,14 @@ from contextlib import closing, contextmanager
 from datetime import datetime
 
 from config import (
-    SFS_BD_PATH, SFS_DATA_DIR, SFS_RPTA_DIR, DIR_PROCESADOS,
+    SFS_BD_PATH, SFS_DATA_DIR, SFS_RPTA_DIR, DIR_PROCESADOS, _SFS_FIRMA_DIR,
     _EXT_DATA, _EXT_DATA_SFS, _ESTADOS_CERRADOS, _ESTADOS_ERROR,
     _ESPERA_XML_SEG, _TIPOS_SFS,
     _ESTADOS_RESUMEN_ABIERTO, _MAX_DES_OBSE,
 )
 from dominio.texto import _texto, _marcas
 from dominio.cdr import _TIPO_RC, _veredicto_cdr, parsear_xml_cdr
+from dominio.comprobante import _nombre_base
 from utilidades_files import _borrar_si_existe
 
 logger = logging.getLogger(__name__)
@@ -357,6 +358,41 @@ def _cdr_ya_procesado(ruc: str, tip: str, num: str) -> bool:
         return os.path.getsize(ruta) > 0
     except OSError:
         return False
+
+
+def leer_xml_firmado(ruc: str, tip: str, num: str) -> bytes | None:
+    """
+    XML firmado que SFS dejó en FIRMA/ para este comprobante, o None si
+    todavía no existe (no se firmó, o se llama antes de tiempo). Usado para
+    adjuntar el XML al PUT de subida del PDF a FuelHub core (ver
+    fuelhub_core/api.py:subir_pdf_comprobante) — es opcional ahí, así que un
+    None simplemente lo deja afuera del payload sin bloquear la subida del PDF.
+    """
+    ruta = os.path.join(_SFS_FIRMA_DIR, f"{_nombre_base(ruc, tip, num)}.xml")
+    try:
+        with open(ruta, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def leer_cdr_xml(ruc: str, tip: str, num: str) -> bytes | None:
+    """
+    XML del CDR ya extraído del .zip que entrega SUNAT (FuelHub core espera el
+    XML plano, no el zip — no lo desempaqueta de su lado), o None si todavía
+    no hay CDR archivado para este comprobante. Mismo orden de búsqueda que
+    _veredicto_archivado: procesados/ primero, RPTA/ después.
+    """
+    for carpeta in (DIR_PROCESADOS, SFS_RPTA_DIR):
+        ruta = os.path.join(carpeta, f"R{ruc}-{tip}-{num}.zip")
+        try:
+            with zipfile.ZipFile(ruta) as z:
+                xmls = [n for n in z.namelist() if n.lower().endswith(".xml")]
+                if xmls:
+                    return z.read(xmls[0])
+        except (OSError, zipfile.BadZipFile):
+            continue
+    return None
 
 
 def _veredicto_archivado(ruc: str, tip: str, num: str) -> str:

@@ -6,6 +6,13 @@ que lo sube a S3 para que la página web de consulta lo sirva. No participa del
 flujo de facturación con SUNAT —es best-effort para esa consulta— así que una
 falla acá nunca detiene el ciclo ni se propaga fuera de él.
 
+De paso, si para ese momento ya existen el XML firmado y/o el CDR en disco, se
+adjuntan al mismo PUT (xmlBase64/cdrBase64 — ambos opcionales en el contrato).
+Es oportunista, no un segundo intento: si el CDR todavía no volvió de SUNAT
+cuando se sube el PDF, esa subida queda sin cdrBase64 para siempre (pdf_enviado
+ya quedó en 1) — aceptable porque el contrato los trata como aditivos y sin
+apuro, no como algo que este ciclo deba garantizar.
+
 Mismo patrón que ciclo_cierres.py: mismas credenciales OAuth2
 (FUELHUB_CORE_CLIENT_ID/SECRET), mismo chequeo de motor.
 """
@@ -13,9 +20,11 @@ import logging
 
 import repositorio
 from config import DATABASE_URL, EMISOR_RUC_OVERRIDE, FUELHUB_CORE_CLIENT_ID, FUELHUB_CORE_CLIENT_SECRET
+from dominio.texto import _codigo
 from aplicacion.bd_app import conectar_bd
 from fuelhub_core.bd import codigo_estacion, pendientes_pdf, marcar_pdf_enviado
 from fuelhub_core.api import subir_pdf_comprobante
+from sfs.bd import leer_xml_firmado, leer_cdr_xml
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +58,13 @@ def ciclo_pdf():
             comprobante_id = fila["id"]
             numeracion = fila["numeracion_comprobante"]
             try:
+                tipo = _codigo(fila["tipo_comprobante"], "01")
+                xml_bytes = leer_xml_firmado(EMISOR_RUC_OVERRIDE, tipo, numeracion)
+                cdr_bytes = leer_cdr_xml(EMISOR_RUC_OVERRIDE, tipo, numeracion)
                 if subir_pdf_comprobante(
                     codigo, EMISOR_RUC_OVERRIDE, numeracion, bytes(fila["pdf_bytes"]),
                     fila["numero_documento_receptor"], fila["fecha_emision"],
+                    xml_bytes, cdr_bytes,
                 ) is not None:
                     marcar_pdf_enviado(conn, comprobante_id)
                     subidos += 1
