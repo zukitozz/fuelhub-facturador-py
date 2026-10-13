@@ -149,3 +149,16 @@ def subir_pdf_comprobante(
         "fechaEmision": fecha_emision,
     }
     return _enviar("PUT", ruta, payload)
+
+
+def enviar_reporte_top_facturas(codigo_estacion: str, semana_inicio: str, top: list, idempotency_key: str) -> dict | None:
+    """
+    POST v1/reportes/top-facturas — reporte semanal antifraude: el top de
+    clientes que más facturaron esa semana y qué despachador generó cada
+    factura. A diferencia de subir_pdf_comprobante, SÍ exige Idempotency-Key
+    (mismo mecanismo que los cierres) — ver estado/reporte_facturas.py para por
+    qué esa clave se genera una sola vez por semana y se reutiliza en cada
+    reintento, nunca una nueva por llamada.
+    """
+    payload = {"codigoEstacion": codigo_estacion, "semanaInicio": semana_inicio, "top": top}
+    return _post("v1/reportes/top-facturas", payload, idempotency_key)

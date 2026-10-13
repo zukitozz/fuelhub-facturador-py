@@ -12,12 +12,13 @@ from watchdog.observers import Observer
 
 from config import (
     INTERVALO_GENERACION_SEG, INTERVALO_BARRIDO_RPTA_SEG, INTERVALO_CIERRES_SEG,
-    INTERVALO_PDF_SEG, SFS_RPTA_DIR, DIR_PROCESADOS, DIR_ERRORES,
+    INTERVALO_PDF_SEG, INTERVALO_REPORTE_FACTURAS_SEG, SFS_RPTA_DIR, DIR_PROCESADOS, DIR_ERRORES,
 )
 from aplicacion.ciclo_generacion import ciclo_generacion
 from aplicacion.ciclo_cdr import procesar_respuestas
 from aplicacion.ciclo_cierres import ciclo_cierres
 from aplicacion.ciclo_pdf import ciclo_pdf
+from aplicacion.ciclo_reporte_facturas import ciclo_reporte_facturas
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,13 @@ def hilo_pdf():
     while True:
         ciclo_pdf()
         time.sleep(INTERVALO_PDF_SEG)
+
+
+def hilo_reporte_facturas():
+    logger.info("Hilo REPORTE iniciado (intervalo: %ds)", INTERVALO_REPORTE_FACTURAS_SEG)
+    while True:
+        ciclo_reporte_facturas()
+        time.sleep(INTERVALO_REPORTE_FACTURAS_SEG)
 
 
 class CDRHandler(FileSystemEventHandler):
