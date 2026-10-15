@@ -229,3 +229,22 @@ def guardar_error_varios(conn, numeraciones: list, detalle: str) -> int:
         f" WHERE numeracion_comprobante IN {_marcas(len(nums))}",
         (detalle, *nums),
     )
+
+
+def guardar_respuesta(conn, numeracion: str, hash_: str, qr: str, url: str, xml_envio: str) -> int:
+    """
+    Guarda lo que facturador-api devolvió al aceptar un comprobante: el hash
+    (DigestValue de la firma, para el código QR que exige SUNAT), el propio QR
+    ya armado, la url donde consultar el comprobante (fuelhub-local la usa
+    como marca de "ya aceptado": nunca debe quedar vacía) y el payload que se
+    mandó, para auditoría.
+
+    Con parámetros, no con texto concatenado: una razón social con apóstrofe
+    ("O'BRIEN") rompe un UPDATE armado a mano.
+    """
+    return _escribir(
+        conn,
+        "UPDATE dbo.Comprobantes SET codigo_hash=?, cadena_para_codigo_qr=?, url=?, xml_envio=? "
+        " WHERE numeracion_comprobante=?",
+        (hash_, qr, url, xml_envio, numeracion),
+    )

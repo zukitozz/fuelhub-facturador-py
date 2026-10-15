@@ -1,264 +1,436 @@
 """
-Caso de uso del hilo Generador: en cada ciclo, lee la BD de la aplicación, genera
-los archivos SFS de lo pendiente y los entrega al facturador local.
+Caso de uso del hilo Generador: en cada ciclo, lee la BD de la aplicación y
+manda cada comprobante pendiente a facturador-api (el servicio en la nube que
+firma y envía a SUNAT a través de SFS) — reemplaza al SFS local que este
+daemon manejaba antes directamente escribiendo archivos para un proceso Java.
+
+Boletas: facturador-api las firma pero nunca las envía solas — quedan a la
+espera del resumen diario, que este mismo ciclo dispara una vez al día (ver
+_procesar_resumen_diario_si_toca).
+
+Se pide `incluir=xml` en el POST para los dos tipos por igual (no solo
+boleta): es la única oportunidad de conseguir el XML de una boleta, porque una
+vez que el resumen diario la consume su propia consulta (GET) empieza a
+devolver 404. Para factura/nota también se homologa el mismo pedido, aunque
+ahí el GET posterior siga funcionando — un solo camino de código en vez de
+dos. El CDR nunca se pide en el POST: para factura/nota se consulta aparte
+cuando hace falta (ver aplicacion/ciclo_pdf.py); una boleta nunca tiene CDR
+propio (es el del resumen que la agrupa).
+
+Manejo de cada estado de la respuesta (spec de facturador-api, HTTP siempre
+201 salvo problemas de transporte — ver estado/envio_api.py para la
+persistencia):
+  - aceptado / aceptado_con_observaciones (factura/nota) → cierra: guarda
+    hash/qr/xml/url, marca enviado=1.
+  - generado (boleta) → se trata igual que un cierre: una boleta nunca pasa
+    por "aceptado" individual, "generado" YA es su estado final.
+  - generado (factura/nota) → SFS la firmó pero no la envió todavía: no se
+    toca nada, sigue en enviado=0 y el próximo ciclo reintenta el POST solo.
+  - enviado / validando / pendiente → SUNAT ya la tiene, falta el CDR: se
+    guarda el xml si vino, no se marca enviado todavía, y se agrega a la
+    cola de "esperando CDR" que se reconsulta por GET en cada ciclo.
+  - rechazado → guarda el motivo (codigo_error + descripcion_error + des_obse),
+    NO marca enviado, NO se reintenta más de MAX_REINTENTOS_RECHAZO veces.
+  - error → ambiguo por diseño (puede ser de red): NO se reintenta a ciegas
+    en el momento. Backoff creciente antes de volver a intentar el mismo
+    POST — la propia API verifica con SUNAT antes de reenviar (spec §5), así
+    que no hace falta que este daemon haga su propio GET de verificación acá.
+  - HTTP 404 (RUC sin alta) → error crítico, corta el ciclo entero.
+  - HTTP 422 (payload inválido) → se trata como un rechazo: hay que corregir
+    el dato, no tiene sentido reintentar igual.
+  - HTTP 502 → la API ya verificó que no se envió nada: se reintenta con
+    backoff, sin gastar presupuesto de rechazos.
+  - Sin respuesta HTTP en absoluto (timeout real, corte de red) → ambiguo de
+    verdad: se resuelve con un GET antes de seguir. Si ni el GET lo resuelve,
+    queda "en vuelo" para el próximo ciclo (idempotencia ante un corte del
+    propio daemon).
 """
 import logging
-import os
 import time
-from datetime import datetime
+from datetime import date, datetime
 
+import integraciones
 from config import (
-    SFS_BD_PATH, EMISOR_RUC_OVERRIDE, SOL_USUARIO, SOL_CLAVE,
-    _ESTADOS_ERROR, _ESTADOS_BLOQUEADO, _NOMBRE_SITU, _MAX_BLOQUEADOS_LOG,
-    MAX_REINTENTOS_RECHAZO, _TIPOS_SFS, ENVIADO_PENDIENTE,
-    _RESUMENES_PATH, _ESTADOS_CERRADOS, DIAS_RETENCION_RESUMENES, _GRACIA_REGISTRO_RC_SEG, HORAS_TICKET_EN_PROCESO, _MAX_DES_OBSE,
+    FACTURADOR_API_URL, NOTIFICADOR_COMPROBANTES,
+    MAX_REINTENTOS_RECHAZO, _MAX_ERRORS_SQL, _MAX_BLOQUEADOS_LOG,
 )
-from dominio.texto import _texto, _codigo, _marcas
-from utilidades_timer import detectar_desfase_bd
-from aplicacion.bd_app import _bd, conectar_bd
-from aplicacion.lecturas import obtener_emisor, obtener_comprobantes_pendientes
-from aplicacion.recuperacion_cdr import recuperar_cdr_pendientes, recuperar_cdr_resumenes
-from sfs.api import sincronizar_bandeja_sfs, activar_procesamiento_sfs
-from sfs.archivos import procesar_comprobante, generar_resumen_diario
-from sfs.bd import (
-    _sfs_bd, _registrar_en_sfs_bd, _docs_en_vuelo, _limpiar_data_cerrados, _tiene_cdr,
-    _eliminar_data_files, _ticket_de_resumen, _veredicto_archivado,
+from aplicacion.bd_app import conectar_bd, _bd, _escribir_bd
+from aplicacion.lecturas import (
+    obtener_emisor, obtener_receptor, obtener_items, obtener_comprobantes_pendientes,
 )
-from sunat.consulta import estado_en_sunat, _guardar_cdr
-from estado.reintentos import _reintentos_de, _contar_reintento, _espera_de, _anotar_espera_de_red, _es_falla_de_red
-from estado.resumenes import (
-    _leer_resumenes, _guardar_resumenes, _lock_resumenes, _olvidar_resumen,
-    _resumen_vencido, _descartar_archivos_de_resumen, _boletas_de_resumen,
-)
-from dominio.cdr import _TIPO_RC
+from utilidades_timer import fecha_local
+from fuelhub_api import cliente
+from estado import envio_api
 
 logger = logging.getLogger(__name__)
 
+# Se elige acá (y no en config.py) porque el adaptador por defecto deja
+# constancia en el log al instanciarse, y para entonces logging ya tiene sus
+# handlers listos (los arma config.py, que este módulo importa antes de
+# llegar a esta línea) — mismo motivo que antes en aplicacion/ciclo_cdr.py.
+_notificador_comprobantes = integraciones.elegir(NOTIFICADOR_COMPROBANTES)
 
-def resetear_rechazados(conn, ruc_emisor: str):
-    if not os.path.exists(SFS_BD_PATH):
-        return
-    # Placeholders dinámicos: _ESTADOS_ERROR puede tener uno o varios estados.
-    marcas = _marcas(len(_ESTADOS_ERROR))
-    with _sfs_bd(escritura=True) as sfs:
-        rows = sfs.execute(
-            f"SELECT NUM_DOCU, TIP_DOCU, DES_OBSE FROM DOCUMENTO "
-            f"WHERE NUM_RUC=? AND IND_SITU IN ({marcas})",
-            (ruc_emisor, *_ESTADOS_ERROR),
-        ).fetchall()
-        if not rows:
-            return
-        reintentados, agotados, esperando = [], [], []
-        for num_docu, tip_docu, des_obse in rows:
-            # Un '06' de red es otra cosa que un rechazo: el comprobante nunca llegó a
-            # SUNAT, los datos están bien, y el mismo envío funciona apenas vuelve el
-            # servicio. Gastarle presupuesto de reintentos lo bloqueaba en menos de 5
-            # minutos frente a un corte de horas (produccion, 2026-08-29: 7 facturas
-            # bloqueadas por un corte de 2 h, todas aceptadas despues sin tocarles un
-            # dato). Se reencola sin tope, espaciado, y con una salvaguarda antes de
-            # reenviar.
-            if _es_falla_de_red(des_obse):
-                falta = _espera_de(num_docu) - time.time()
-                if falta > 0:
-                    esperando.append((tip_docu, num_docu, falta / 60))
-                    continue
-                # Un "no se pudo enviar" no distingue entre "nunca salió" y "salió y
-                # la respuesta se perdió". Reenviar el segundo caso duplica el
-                # comprobante ante SUNAT, y eso solo se deshace con una nota de
-                # crédito, así que hace falta una evidencia antes de tocar nada.
-                #
-                # Para un resumen esa evidencia NO es estado_en_sunat(): esa consulta
-                # va contra billConsultService, que solo acepta comprobantes
-                # individuales, y con tip_docu='RC' SUNAT contesta "0009: EL tipo de
-                # comprobante debe de ser (01, 07, 08, ...)". RC no está en esa lista
-                # y nunca va a estarlo, así que la respuesta no dice nada del
-                # documento y el resumen quedaba reintentando una consulta imposible
-                # para siempre —RC-20260906-016 acumuló 54 consultas así, con sus
-                # boletas sin declarar—.
-                #
-                # La evidencia para un resumen es el ticket: lo escribe el SFS cuando
-                # SUNAT responde a sendSummary, así que su ausencia significa que el
-                # envío no llegó. Es el equivalente del 0127 que autoriza a reenviar
-                # un comprobante suelto. Al revés, un resumen CON ticket ya fue
-                # recibido y no se reenvía por acá: lo resuelve
-                # recuperar_cdr_resumenes() consultando ese ticket.
-                if tip_docu == _TIPO_RC:
-                    if _ticket_de_resumen(ruc_emisor, num_docu):
-                        cortes, minutos = _anotar_espera_de_red(
-                            num_docu, tip_docu, _texto(des_obse))
-                        esperando.append((tip_docu, num_docu, minutos))
-                        continue
-                    # Sin ticket: SUNAT no lo recibió y se puede volver a armar.
-                else:
-                    estado, cdr, mensaje = estado_en_sunat(ruc_emisor, tip_docu, num_docu)
-                    if estado == "registrado":
-                        _guardar_cdr(ruc_emisor, tip_docu, num_docu, cdr, mensaje)
-                        continue
-                    if estado != "no_registrado":
-                        cortes, minutos = _anotar_espera_de_red(
-                            num_docu, tip_docu, _texto(des_obse))
-                        esperando.append((tip_docu, num_docu, minutos))
-                        continue
-                cortes, minutos = _anotar_espera_de_red(num_docu, tip_docu, _texto(des_obse))
-                if tip_docu == _TIPO_RC:
-                    # Un resumen no es una fila de Comprobantes: marcar_enviado() con
-                    # su numeración no matchea nada. Lo que hay que devolver a la cola
-                    # son sus boletas, y para eso alcanza con olvidar el resumen —el
-                    # ciclo siguiente las reagrupa en uno nuevo—. Sin esto, borrar la
-                    # fila del SFS dejaba al resumen sin rastro y sus boletas seguían
-                    # retenidas por algo que ya no existía.
-                    boletas_libres = _olvidar_resumen(num_docu)
-                    _descartar_archivos_de_resumen(ruc_emisor, num_docu)
-                    logger.warning(
-                        "El resumen %s no llegó a obtener ticket, así que SUNAT no lo "
-                        "recibió: se descarta y sus %d boleta(s) vuelven a la cola "
-                        "para armar uno nuevo.", num_docu, len(boletas_libres),
-                    )
-                else:
-                    _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
-                                         limpiar_error=False)
-                sfs.execute(
-                    f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
-                    f"AND IND_SITU IN ({marcas})",
-                    (ruc_emisor, tip_docu, num_docu, *_ESTADOS_ERROR),
-                )
-                reintentados.append((tip_docu, num_docu, f"corte {cortes}"))
-                continue
+_ESTADOS_ACEPTADOS = ("aceptado", "aceptado_con_observaciones")
+_ESTADOS_ESPERANDO_CDR = ("enviado", "validando", "pendiente")
 
-            # De acá para abajo el motivo NO es de red: un rechazo real, o —lo que
-            # importa— uno que todavía no sabemos leer. La lista de _SENALES_DE_RED es
-            # corta a propósito, así que esta rama es donde cae lo desconocido, y para
-            # un resumen era un pozo: marcar_enviado() con una numeración RC no matchea
-            # ninguna fila de Comprobantes, el DELETE lo sacaba de la bandeja, y como
-            # nadie llamaba a _olvidar_resumen() su entrada quedaba sin marcar. El
-            # resumen desaparecía de todos lados menos de resumenes.json, donde seguía
-            # reteniendo sus boletas para siempre. Producción, 2026-09-10: 6 resúmenes
-            # así, 1195 boletas del día anterior retenidas por algo que ya no existía.
-            #
-            # Se decide con el ticket, el mismo criterio que la rama de red de arriba.
-            if tip_docu == _TIPO_RC:
-                if _ticket_de_resumen(ruc_emisor, num_docu):
-                    # SUNAT ya lo recibió: su CDR llega detrás de ese ticket y lo
-                    # resuelve recuperar_cdr_resumenes(). El ticket se lee de esta misma
-                    # fila, así que borrarla —lo que hacía antes— dejaba al resumen sin
-                    # nada que consultar y sin forma de cerrarse nunca.
-                    esperando.append((tip_docu, num_docu, 0))
-                    continue
-                boletas_libres = _olvidar_resumen(num_docu)
-                _descartar_archivos_de_resumen(ruc_emisor, num_docu)
-                logger.warning(
-                    "El resumen %s quedó en error sin llegar a obtener ticket (%s). "
-                    "SUNAT no lo recibió: se descarta y sus %d boleta(s) vuelven a la "
-                    "cola para armar uno nuevo.",
-                    num_docu, _texto(des_obse)[:120], len(boletas_libres),
-                )
-                sfs.execute(
-                    f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
-                    f"AND IND_SITU IN ({marcas})",
-                    (ruc_emisor, tip_docu, num_docu, *_ESTADOS_ERROR),
-                )
-                reintentados.append((tip_docu, num_docu, "resumen descartado"))
-                continue
+# Cuántas fallas de infraestructura seguidas dentro de UN ciclo alcanzan para
+# cortarlo y no seguir martillando un servicio que parece caído.
+_UMBRAL_FALLOS_INFRA_CICLO = 3
 
-            # Se consulta antes de sumar: al agotarse, el documento se queda en '10'
-            # y esta rama corre en cada ciclo. Sumando siempre, el contador crecería
-            # sin sentido y reescribiría el archivo cada 60 segundos para siempre.
-            if _reintentos_de(num_docu) >= MAX_REINTENTOS_RECHAZO:
-                # Se deja la fila en DOCUMENTO: así el comprobante sigue contando como
-                # "en vuelo" —no se regenera— y el reporte de bloqueados lo levanta.
-                agotados.append((tip_docu, num_docu))
-                continue
-            intentos = f"{_contar_reintento(num_docu, tip_docu, _texto(des_obse))}/{MAX_REINTENTOS_RECHAZO}"
-            # Vuelve a la cola sin tocar errors: el motivo del rechazo tiene que
-            # seguir a la vista mientras se reintenta.
-            _bd().marcar_enviado(conn, num_docu, enviado=ENVIADO_PENDIENTE,
-                                 limpiar_error=False)
-            sfs.execute(
-                f"DELETE FROM DOCUMENTO WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? "
-                f"AND IND_SITU IN ({marcas})",
-                (ruc_emisor, tip_docu, num_docu, *_ESTADOS_ERROR),
-            )
-            reintentados.append((tip_docu, num_docu, intentos))
+# Último día (date) en que se corrió el intento de armar el resumen diario —
+# en memoria, no en disco: perderlo en un reinicio de PM2 solo significa que
+# se vuelve a intentar ese mismo día, no tiene costo.
+_ultima_fecha_resumen = None
 
-    if reintentados:
-        logger.info(
-            "%d comprobante(s) vuelven a la cola: %s",
-            len(reintentados),
-            ", ".join(f"{t}-{n} ({i})" for t, n, i in reintentados),
-        )
-    if esperando:
-        # A nivel INFO y con su propio texto: estos NO requieren que nadie haga nada,
-        # solo que vuelva el servicio. Mezclarlos con los bloqueados mandaba a buscar
-        # una corrección manual que no existía.
-        logger.info(
-            "%d comprobante(s) esperando que vuelva SUNAT; reintentan solos: %s",
-            len(esperando),
-            ", ".join(f"{t}-{n} (en {m:.0f} min)" for t, n, m in esperando),
-        )
-    if agotados:
-        # Reenviar de nuevo daría el mismo rechazo: los datos son idénticos. Solo
-        # llegan acá los que NO son falla de red — esos no gastan presupuesto.
-        logger.error(
-            "%d comprobante(s) agotaron los %d reenvíos permitidos y NO se reenviarán "
-            "hasta que se corrija el dato observado: %s",
-            len(agotados), MAX_REINTENTOS_RECHAZO,
-            ", ".join(f"{t}-{n}" for t, n in agotados),
+
+class _RucNoDadoDeAlta(Exception):
+    """El RUC de esta estación no está registrado en facturador-api (404).
+    Corta el ciclo entero — no tiene sentido seguir mandando el resto."""
+
+
+class _FallaInfraestructura(Exception):
+    """502, "error", o una respuesta sin HTTP claro — el comprobante se
+    reintentará solo, pero cuenta para el backoff del ciclo si se repite
+    seguido."""
+
+
+def _notificar_comprobante_aceptado(ruc: str, tipo: str, numeracion: str):
+    """
+    Avisa a la integración configurada (ver integraciones/README.md) que este
+    comprobante ya quedó cerrado en la BD de la app.
+
+    Envuelto en su propio try/except a propósito: esta integración es
+    best-effort y ajena al flujo de facturación, así que una falla acá no
+    puede impedir que el ciclo siga.
+    """
+    try:
+        _notificador_comprobantes.notificar(ruc, tipo, numeracion)
+    except Exception:
+        logger.exception(
+            "Notificador de comprobantes (%s) falló para %s-%s; no afecta el cierre.",
+            NOTIFICADOR_COMPROBANTES, tipo, numeracion,
         )
 
 
-def _activar_pendientes_sfs_bd(ruc_emisor: str, ya_procesados: list):
-    if not os.path.exists(SFS_BD_PATH):
-        return
-    ya_keys = {(d["tip_docu"], d["num_docu"]) for d in ya_procesados}
-    with _sfs_bd(escritura=True) as sfs:
-        tipos = sorted(_TIPOS_SFS)
-        rows = sfs.execute(
-            "SELECT TIP_DOCU, NUM_DOCU, NOM_ARCH FROM DOCUMENTO "
-            f"WHERE NUM_RUC=? AND TIP_DOCU IN ({_marcas(len(tipos))}) "
-            "AND IND_SITU IN ('01','02')",
-            (ruc_emisor, *tipos),
-        ).fetchall()
-        docs_extra = []
-        for tip, num, nom_arch in rows:
-            if (tip, num) in ya_keys:
-                continue
-            if _tiene_cdr(ruc_emisor, tip, num):
-                # Se cierra porque el CDR existe, no porque diga que fue aceptado: hay
-                # que leerlo para no rotular "Aceptado" algo que SUNAT rechazó.
-                sfs.execute(
-                    "UPDATE DOCUMENTO SET IND_SITU='03', DES_OBSE=? "
-                    "WHERE NUM_RUC=? AND TIP_DOCU=? AND NUM_DOCU=? AND IND_SITU IN ('01','02')",
-                    (_veredicto_archivado(ruc_emisor, tip, num)[:_MAX_DES_OBSE],
-                     ruc_emisor, tip, num),
-                )
-                _eliminar_data_files(nom_arch or f"{ruc_emisor}-{tip}-{num}")
-                continue
-            docs_extra.append({"num_ruc": ruc_emisor, "tip_docu": tip, "num_docu": num})
-    if docs_extra:
-        logger.info("%d doc(s) en SFS BD pendientes de activar.", len(docs_extra))
-        activar_procesamiento_sfs(docs_extra)
+def _codigo_api(tipo: str, numeracion: str) -> str:
+    return f"{tipo}-{numeracion}"
 
 
-def _reportar_clasificacion(fuera_alcance: int, omitidos: int, bloqueados: list):
-    """Resume en el log qué pasó con los pendientes que no se generaron este ciclo."""
-    if fuera_alcance:
-        logger.info(
-            "%d comprobante(s) de tipo fuera de alcance (solo se emiten %s).",
-            fuera_alcance, ", ".join(sorted(_TIPOS_SFS)),
-        )
-    if omitidos:
-        logger.info("%d comprobante(s) ya entregados al SFS, esperando CDR.", omitidos)
-    if not bloqueados:
-        return
-    # No son "esperando CDR": el SFS nunca los mandó y no lo va a hacer solo.
-    logger.warning(
-        "%d comprobante(s) BLOQUEADOS en el SFS — requieren intervención manual:",
-        len(bloqueados),
+def _url_comprobante(ruc: str, codigo: str) -> str:
+    return f"{FACTURADOR_API_URL}/empresas/{ruc}/comprobantes/{codigo}"
+
+
+def _motivo_rechazo(body: dict) -> str:
+    """codigo_error + descripcion_error, con des_obse como respaldo si no
+    vino ninguno de los dos (ver spec §3)."""
+    partes = [p for p in (body.get("codigo_error"), body.get("descripcion_error")) if p]
+    return " - ".join(partes) or body.get("des_obse") or "sin detalle"
+
+
+def _armar_payload(conn, comp: dict) -> dict:
+    receptor = obtener_receptor(conn, comp["factura_id"])
+    items = obtener_items(conn, comp["factura_id"])
+    payload = {
+        "numeracion_comprobante": comp["numeracion_comprobante"],
+        "tipo_comprobante": comp["tipo_comprobante"],
+        "fecha_emision": fecha_local(comp["fecha_emision"]).isoformat(),
+        "total": comp["total"],
+        "gravadas": comp["gravadas"],
+        "igv": comp["igv"],
+        "tipo_moneda": comp["tipo_moneda"],
+        "monto_letras": comp["monto_letras"],
+        "items": items,
+    }
+    if receptor:
+        payload["receptor"] = receptor
+    if comp.get("referencia"):
+        payload["referencia"] = comp["referencia"]
+    return payload
+
+
+def _cerrar_comprobante(conn, ruc: str, tipo: str, numeracion: str, body: dict):
+    """
+    Cierre exitoso: aceptado/aceptado_con_observaciones (factura/nota), o
+    generado (boleta — ahí YA es el estado final, nunca pasa a "aceptado"
+    individual). Guarda hash/qr/xml/url y marca enviado=1.
+    """
+    codigo = _codigo_api(tipo, numeracion)
+    url = _url_comprobante(ruc, codigo)
+    _escribir_bd(
+        _bd().guardar_respuesta, conn, numeracion,
+        body.get("hash"), body.get("qr"), url, body.get("xml") or "",
     )
-    for tip, num, situ, obse in bloqueados[:_MAX_BLOQUEADOS_LOG]:
-        logger.warning("    %s-%s [%s]: %s", tip, num, _NOMBRE_SITU.get(situ, situ), obse or "sin detalle")
-    if len(bloqueados) > _MAX_BLOQUEADOS_LOG:
-        logger.warning("    ... y %d más.", len(bloqueados) - _MAX_BLOQUEADOS_LOG)
+    _escribir_bd(_bd().marcar_enviado, conn, numeracion, True, True)
+    envio_api.limpiar_rechazo(numeracion)
+    envio_api.limpiar_espera_infra(numeracion)
+    envio_api.olvidar_en_vuelo(numeracion)
+    envio_api.quitar_esperando_cdr(numeracion)
+    _notificar_comprobante_aceptado(ruc, tipo, numeracion)
+    logger.info("Comprobante %s cerrado (%s).", codigo, body.get("estado"))
+
+
+def _cerrar_rechazado(numeracion: str, motivo: str):
+    detalle = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {motivo}"[:_MAX_ERRORS_SQL]
+    conn = None
+    try:
+        conn = conectar_bd()
+        _escribir_bd(_bd().guardar_error, conn, numeracion, detalle)
+    finally:
+        if conn:
+            conn.close()
+    envio_api.olvidar_en_vuelo(numeracion)
+    envio_api.quitar_esperando_cdr(numeracion)
+    intentos = envio_api.contar_rechazo(numeracion, motivo)
+    if intentos >= MAX_REINTENTOS_RECHAZO:
+        logger.error(
+            "Comprobante %s agotó los %d reenvíos y NO se reenviará hasta que se "
+            "corrija el dato observado: %s", numeracion, MAX_REINTENTOS_RECHAZO, motivo,
+        )
+    else:
+        logger.warning(
+            "Comprobante %s rechazado (intento %d/%d): %s",
+            numeracion, intentos, MAX_REINTENTOS_RECHAZO, motivo,
+        )
+
+
+def _resolver_ambiguo(ruc: str, tipo: str, numeracion: str) -> bool:
+    """
+    Pregunta a facturador-api qué pasó con un comprobante cuya llamada anterior
+    quedó sin respuesta HTTP clara (timeout real, corte de red, o un corte
+    justo a mitad del POST de una corrida anterior). Devuelve True si quedó
+    resuelto, False si sigue ambiguo — ahí no se toca nada, se vuelve a
+    preguntar en el próximo ciclo.
+    """
+    codigo = _codigo_api(tipo, numeracion)
+    resp = cliente.consultar_comprobante(ruc, codigo)
+    if resp.status == 404:
+        logger.info("Comprobante %s no llegó a facturador-api (404); se reintentará.", codigo)
+        envio_api.olvidar_en_vuelo(numeracion)
+        return True
+    if resp.status == 200 and resp.body:
+        estado = resp.body.get("estado")
+        if estado in _ESTADOS_ACEPTADOS or (tipo == "03" and estado == "generado"):
+            conn = None
+            try:
+                conn = conectar_bd()
+                _cerrar_comprobante(conn, ruc, tipo, numeracion, resp.body)
+            finally:
+                if conn:
+                    conn.close()
+            return True
+        if estado == "rechazado":
+            _cerrar_rechazado(numeracion, _motivo_rechazo(resp.body))
+            return True
+        # generado (factura/nota, sin enviar aún) / enviado-validando-pendiente
+        # / error: sigue en curso, no se toca.
+    logger.info("Comprobante %s sigue ambiguo (HTTP %s); se reintenta la consulta.", codigo, resp.status)
+    return False
+
+
+def _resolver_pendientes_en_vuelo(ruc: str):
+    """Antes de mandar nada nuevo, resuelve lo que quedó "en vuelo" de una
+    corrida anterior — ver idempotencia en el docstring del módulo."""
+    pendientes = envio_api.en_vuelo()
+    if not pendientes:
+        return
+    logger.info("%d comprobante(s) en vuelo de una corrida anterior; resolviendo...", len(pendientes))
+    for numeracion, tipo in pendientes.items():
+        try:
+            _resolver_ambiguo(ruc, tipo, numeracion)
+        except Exception:
+            logger.exception("Error resolviendo %s-%s en vuelo", tipo, numeracion)
+
+
+def _resolver_esperando_cdr(ruc: str):
+    """
+    Reconsulta los comprobantes que SUNAT ya tiene pero todavía sin CDR
+    (enviado/validando/pendiente) — no son "en vuelo" (esos son llamadas sin
+    respuesta clara) ni rechazos, simplemente falta que aparezca el CDR.
+    """
+    pendientes = envio_api.esperando_cdr()
+    for numeracion, tipo in pendientes.items():
+        codigo = _codigo_api(tipo, numeracion)
+        resp = cliente.consultar_comprobante(ruc, codigo)
+        if resp.status != 200 or not resp.body:
+            continue
+        estado = resp.body.get("estado")
+        if estado in _ESTADOS_ACEPTADOS:
+            conn = None
+            try:
+                conn = conectar_bd()
+                _cerrar_comprobante(conn, ruc, tipo, numeracion, resp.body)
+            finally:
+                if conn:
+                    conn.close()
+        elif estado == "rechazado":
+            _cerrar_rechazado(numeracion, _motivo_rechazo(resp.body))
+        # sigue esperando: no se toca, se reconsulta en el próximo ciclo.
+
+
+def _procesar_comprobante(conn, ruc: str, comp: dict):
+    tipo = comp["tipo_comprobante"]
+    numeracion = comp["numeracion_comprobante"]
+    codigo = _codigo_api(tipo, numeracion)
+
+    payload = _armar_payload(conn, comp)
+    envio_api.marcar_en_vuelo(numeracion, tipo)
+    resp = cliente.crear_comprobante(ruc, payload, numeracion)
+
+    if resp.status == 201 and resp.body:
+        estado = resp.body.get("estado")
+        if estado in _ESTADOS_ACEPTADOS or (tipo == "03" and estado == "generado"):
+            _cerrar_comprobante(conn, ruc, tipo, numeracion, resp.body)
+            return
+        if estado in _ESTADOS_ESPERANDO_CDR:
+            # SUNAT ya la tiene, falta el CDR. Se guarda el xml si vino (para
+            # boleta sería imposible más adelante; para factura/nota no hay
+            # drama pero tampoco cuesta nada guardarlo ya), sin marcar enviado.
+            xml = resp.body.get("xml")
+            if xml:
+                _escribir_bd(
+                    _bd().guardar_respuesta, conn, numeracion,
+                    resp.body.get("hash"), resp.body.get("qr"),
+                    _url_comprobante(ruc, codigo), xml,
+                )
+            envio_api.agregar_esperando_cdr(numeracion, tipo)
+            envio_api.olvidar_en_vuelo(numeracion)
+            return
+        if estado == "generado":
+            # Factura/nota firmada pero todavía sin enviar: no se toca nada,
+            # sigue en enviado=0 y el próximo ciclo la vuelve a intentar sola.
+            envio_api.olvidar_en_vuelo(numeracion)
+            return
+        if estado == "rechazado":
+            _cerrar_rechazado(numeracion, _motivo_rechazo(resp.body))
+            return
+        if estado == "error":
+            # Ambiguo por diseño: la propia API verifica con SUNAT antes de
+            # reenviar en el próximo intento (spec §5) — acá solo aplica
+            # backoff, no hace falta un GET propio de verificación.
+            minutos = envio_api.anotar_espera_infra(numeracion)
+            envio_api.olvidar_en_vuelo(numeracion)
+            logger.warning(
+                "Comprobante %s en estado 'error' (%s); se reintenta en %.0f min.",
+                codigo, resp.body.get("des_obse", ""), minutos,
+            )
+            raise _FallaInfraestructura()
+        logger.warning("Comprobante %s: estado desconocido %r; se revisa a mano.", codigo, estado)
+        envio_api.olvidar_en_vuelo(numeracion)
+        return
+
+    if resp.status == 404:
+        logger.error(
+            "facturador-api respondió 404 para el RUC %s — no está dado de alta "
+            "en el servicio. Se corta el ciclo: nada se puede emitir hasta "
+            "resolverlo.", ruc,
+        )
+        envio_api.olvidar_en_vuelo(numeracion)
+        raise _RucNoDadoDeAlta()
+
+    if resp.status == 422:
+        detalle = (resp.body or {}).get("detail") or (resp.body or {}).get("message") or "parámetros inválidos"
+        _cerrar_rechazado(numeracion, str(detalle))
+        return
+
+    if resp.status == 502:
+        minutos = envio_api.anotar_espera_infra(numeracion)
+        envio_api.olvidar_en_vuelo(numeracion)
+        logger.warning(
+            "facturador-api verificó que %s no se envió (502); se reintenta en %.0f min.",
+            codigo, minutos,
+        )
+        raise _FallaInfraestructura()
+
+    # Sin respuesta HTTP clara (timeout real, corte de red) o un 5xx no
+    # documentado: se intenta resolver YA con un GET dentro de esta misma
+    # pasada — si no alcanza, queda "en vuelo" para el próximo ciclo.
+    _resolver_ambiguo(ruc, tipo, numeracion)
+    raise _FallaInfraestructura()
+
+
+def _procesar_resumen_diario_si_toca(ruc: str):
+    global _ultima_fecha_resumen
+    hoy = date.today()
+    if _ultima_fecha_resumen != hoy:
+        _ultima_fecha_resumen = hoy
+        _procesar_resumenes_diarios(ruc)
+    _resolver_resumenes_pendientes(ruc)
+
+
+def _procesar_resumenes_diarios(ruc: str):
+    """
+    POST /resumenes-diarios repetidas veces hasta agotar los pendientes
+    (respuesta con "mensaje") o el tope diario de la propia API (409).
+    """
+    intentos = 0
+    while intentos < 25:   # margen sobre el tope de 20 que ya aplica la API
+        intentos += 1
+        resp = cliente.crear_resumen_diario(ruc)
+        if resp.status == 409:
+            logger.warning("Tope diario de resúmenes alcanzado en facturador-api; se sigue mañana.")
+            return
+        if resp.status != 201 or not resp.body:
+            logger.warning("No se pudo armar el resumen diario (HTTP %s); se reintenta otro día.", resp.status)
+            return
+        if "mensaje" in resp.body:
+            logger.info("Sin boletas pendientes de resumir: %s", resp.body["mensaje"])
+            return
+        numeracion_rc = resp.body.get("numeracion_rc")
+        boletas = resp.body.get("boletas", [])
+        logger.info(
+            "Resumen diario %s armado (%d boleta(s)); se resuelve con consultas "
+            "posteriores.", numeracion_rc, resp.body.get("cantidad_boletas", len(boletas)),
+        )
+        if numeracion_rc:
+            envio_api.agregar_resumen_pendiente(numeracion_rc, boletas)
+
+
+def _reencolar_boletas_de_resumen_rechazado(numeracion_rc: str, boletas: list):
+    """
+    El resumen se rechazó: sus boletas no quedaron declaradas ante SUNAT.
+    Vuelven a enviado=0 para que el próximo ciclo las regenere (nuevo POST
+    individual con hash/qr/xml propios) y entren a un resumen nuevo.
+    """
+    conn = None
+    try:
+        conn = conectar_bd()
+        for numeracion in boletas:
+            _escribir_bd(_bd().marcar_enviado, conn, numeracion, False, False)
+            _escribir_bd(
+                _bd().guardar_error, conn, numeracion,
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Resumen {numeracion_rc} rechazado; "
+                f"se regenera para un resumen nuevo."[:_MAX_ERRORS_SQL],
+            )
+    finally:
+        if conn:
+            conn.close()
+    logger.error(
+        "Resumen %s RECHAZADO por SUNAT; sus %d boleta(s) vuelven a la cola "
+        "para regenerarse: %s", numeracion_rc, len(boletas), ", ".join(boletas[:_MAX_BLOQUEADOS_LOG]),
+    )
+
+
+def _resolver_resumenes_pendientes(ruc: str):
+    """
+    Consulta GET .../comprobantes/RC-{numeracion_rc} de cada resumen todavía
+    sin veredicto — esa consulta ya resuelve el ticket de SUNAT del lado del
+    servidor.
+    """
+    for numeracion_rc, boletas in envio_api.resumenes_pendientes().items():
+        codigo = f"RC-{numeracion_rc}"
+        resp = cliente.consultar_comprobante(ruc, codigo)
+        if resp.status != 200 or not resp.body:
+            logger.info("Resumen %s: todavía sin resolver (HTTP %s).", numeracion_rc, resp.status)
+            continue
+        estado = resp.body.get("estado")
+        if estado in _ESTADOS_ACEPTADOS:
+            logger.info("Resumen %s aceptado por SUNAT (%d boleta(s)).", numeracion_rc, len(boletas))
+            envio_api.quitar_resumen_pendiente(numeracion_rc)
+        elif estado == "rechazado":
+            envio_api.quitar_resumen_pendiente(numeracion_rc)
+            _reencolar_boletas_de_resumen_rechazado(numeracion_rc, boletas)
+        else:
+            logger.info("Resumen %s todavía en curso (%s).", numeracion_rc, estado)
 
 
 def ciclo_generacion():
@@ -268,242 +440,64 @@ def ciclo_generacion():
         conn = conectar_bd()
         emisor = obtener_emisor(conn)
         if not emisor:
-            logger.error("No se encontró información del Emisor en BD.")
+            logger.error("No se encontró información del Emisor en BD (falta EMISOR_RUC en el .env).")
             return
+        ruc = emisor["ruc"]
 
-        ruc_emisor = EMISOR_RUC_OVERRIDE or _texto(emisor.get("ruc"), "00000000000")
+        _resolver_pendientes_en_vuelo(ruc)
+        _resolver_esperando_cdr(ruc)
 
-        # Antes de leer una sola fecha: medir con qué reloj las guarda la aplicación.
-        # De esto depende qué día se le declara a SUNAT (ver utilidades_timer.detectar_desfase_bd).
-        detectar_desfase_bd(conn)
+        pendientes = obtener_comprobantes_pendientes(conn)
+        logger.info("%d comprobante(s) pendiente(s).", len(pendientes))
 
-        # Primero que el SFS relea DATA: todo lo que sigue —qué está en vuelo, qué
-        # falta activar, qué se puede limpiar— se decide mirando su bandeja, y sin
-        # esto no refleja lo que quedó escrito en ciclos anteriores.
-        sincronizar_bandeja_sfs()
-
-        resetear_rechazados(conn, ruc_emisor)
-
-        # Antes de decidir qué generar: si algo se envió y su CDR nunca volvió
-        # —típicamente por un corte de conexión—, preguntarle a SUNAT si lo tiene.
-        # Y los resúmenes ya enviados esperan su CDR detrás de un ticket, que hay
-        # que consultar aparte: SUNAT no lo devuelve en el momento del envío.
-        if SOL_USUARIO and SOL_CLAVE:
-            recuperar_cdr_pendientes(ruc_emisor)
-            recuperar_cdr_resumenes(ruc_emisor)
-
-        comprobantes = obtener_comprobantes_pendientes(conn)
-        logger.info("%d comprobante(s) pendiente(s).", len(comprobantes))
-
-        en_vuelo = _docs_en_vuelo(ruc_emisor)
-        docs_generados = []
-        bloqueados = []
-        omitidos = fuera_alcance = 0
-        for comp in comprobantes:
+        bloqueados_ahora = envio_api.bloqueados()
+        fallos_infra = procesados = 0
+        for comp in pendientes:
+            numeracion = comp["numeracion_comprobante"]
+            if numeracion in bloqueados_ahora:
+                continue
             try:
-                tip = _codigo(comp.get("tipo_comprobante"), "01")
-                num = _texto(comp.get("numeracion_comprobante"))
-                # Fuera de alcance: se descarta acá para no regenerar sus archivos
-                # en cada ciclo, ya que nunca van a entrar al SFS.
-                if tip not in _TIPOS_SFS:
-                    fuera_alcance += 1
-                    continue
-                # Sigue en enviado=0 pero el SFS ya lo tiene: no reenviar. Puede estar
-                # esperando CDR o trabado en un estado que el daemon no resuelve solo.
-                if (tip, num) in en_vuelo:
-                    situ, obse = en_vuelo[(tip, num)]
-                    # Un '06' de red no está trabado: lo reintenta resetear_rechazados()
-                    # solo, apenas vuelva el servicio. Reportarlo como BLOQUEADO mandaba
-                    # a buscar una corrección manual que no hacía falta.
-                    if situ in _ESTADOS_BLOQUEADO and not _es_falla_de_red(obse):
-                        bloqueados.append((tip, num, situ, obse))
-                    else:
-                        omitidos += 1
-                    continue
-                if procesar_comprobante(conn, comp, ruc_emisor):
-                    docs_generados.append({
-                        "num_ruc":  ruc_emisor,
-                        "tip_docu": tip,
-                        "num_docu": num,
-                    })
+                _procesar_comprobante(conn, ruc, comp)
+                procesados += 1
+            except _RucNoDadoDeAlta:
+                return
+            except _FallaInfraestructura:
+                fallos_infra += 1
+                if fallos_infra >= _UMBRAL_FALLOS_INFRA_CICLO:
+                    logger.warning(
+                        "%d falla(s) de infraestructura seguidas en este ciclo; se "
+                        "corta acá y se reintenta en el próximo.", fallos_infra,
+                    )
+                    break
             except Exception:
-                logger.exception("Error procesando %r", comp.get("numeracion_comprobante"))
+                logger.exception("Error procesando %s", numeracion)
 
-        # Las boletas no entran al loop de arriba (ver aplicacion/lecturas.py):
-        # se agrupan acá en un resumen diario, que de ahí en más sigue el mismo
-        # camino que cualquier otro documento (activar_procesamiento_sfs, etc.).
-        try:
-            resumen_doc = generar_resumen_diario(conn, ruc_emisor)
-            if resumen_doc:
-                docs_generados.append(resumen_doc)
-        except Exception:
-            logger.exception("Error generando el resumen diario de boletas")
+        if bloqueados_ahora:
+            logger.warning(
+                "%d comprobante(s) bloqueados (agotaron %d reenvíos) — requieren "
+                "intervención manual: %s",
+                len(bloqueados_ahora), MAX_REINTENTOS_RECHAZO,
+                ", ".join(list(bloqueados_ahora)[:_MAX_BLOQUEADOS_LOG]),
+            )
 
-        # Mantenimiento de resumenes.json, no parte del flujo: se hace después de
-        # generar para que una falla acá nunca impida emitir un resumen, y por su
-        # cuenta corre una sola vez al día (ver _podar_resumenes).
-        try:
-            _podar_resumenes(conn)
-        except Exception:
-            logger.exception("Error podando %s", os.path.basename(_RESUMENES_PATH))
+        if procesados and fallos_infra == 0:
+            envio_api.limpiar_fallos_ciclo()
+        elif fallos_infra and procesados == 0 and pendientes:
+            # El ciclo entero no pudo avanzar nada por fallas de infraestructura:
+            # backoff creciente para no martillar un servicio que parece caído.
+            fallos_ciclo = envio_api.contar_fallo_ciclo()
+            espera_min = min(2 ** (fallos_ciclo - 1), 15)
+            logger.warning(
+                "%d corrida(s) seguidas sin poder avanzar nada por fallas de "
+                "infraestructura; se pausa %d min antes del próximo intento.",
+                fallos_ciclo, espera_min,
+            )
+            time.sleep(espera_min * 60)
 
-        _reportar_clasificacion(fuera_alcance, omitidos, bloqueados)
-        # Va aparte porque los resúmenes no son filas de Comprobantes y por eso nunca
-        # entran en la lista de bloqueados que arma el bucle de arriba.
-        _reportar_resumenes_trabados(ruc_emisor)
-
-        if docs_generados:
-            logger.info("%d comprobante(s) generados, entregando al SFS...", len(docs_generados))
-            # Solo se registra lo que el SFS confirmó; lo demás sigue en enviado=0
-            # y se reintenta en el próximo ciclo.
-            enviados = activar_procesamiento_sfs(docs_generados)
-            _registrar_en_sfs_bd(ruc_emisor, enviados)
-
-            no_enviados = len(docs_generados) - len(enviados)
-            if no_enviados:
-                logger.warning(
-                    "%d comprobante(s) no llegaron al SFS; se reintentan en el próximo ciclo.",
-                    no_enviados,
-                )
-
-        _activar_pendientes_sfs_bd(ruc_emisor, docs_generados)
-
-        # Se relee el estado en vez de reusar el de arriba: lo entregado en este mismo
-        # ciclo pudo cerrarse ya, y así sus archivos no esperan al ciclo siguiente.
-        cerrados = _limpiar_data_cerrados(ruc_emisor, _docs_en_vuelo(ruc_emisor))
-        if cerrados:
-            logger.info("%d comprobante(s) cerrados; archivos de DATA eliminados.", cerrados)
+        _procesar_resumen_diario_si_toca(ruc)
 
     except Exception:
         logger.exception("Error en ciclo_generacion")
     finally:
         if conn:
             conn.close()
-
-
-def _numeraciones_pendientes(conn, numeraciones) -> set:
-    """Cuáles de estas numeraciones siguen en enviado=0."""
-    buscadas = set(numeraciones)
-    return {n for f in _bd().pendientes(conn)
-            if (n := _texto(f.get("numeracion_comprobante"))) in buscadas}
-
-
-def _podar_resumenes(conn):
-    """
-    Saca de resumenes.json las entradas ya resueltas que pasaron el margen.
-
-    Hasta el 2026-09-09 nada podaba ese archivo: la única eliminación era el pop() de
-    _olvidar_resumen(), que es justamente lo que este arreglo dejó de hacer. Sin una
-    política de retención el archivo solo crece —199 KB y 8.432 referencias a boletas
-    al momento del incidente, con entradas de 11 días atrás que ya no cumplían ninguna
-    función—.
-
-    Corre una vez por día porque es mantenimiento, no parte del flujo: así la consulta
-    de pendientes que necesita no se repite en cada ciclo.
-
-    Dos entradas nunca se podan, por viejas que sean: una cuyo resumen siga sin
-    resolverse (ver _resumen_vencido) y una cuyas boletas sigan en enviado=0 aunque el
-    resumen figure cerrado —pasa cuando SUNAT observó alguna línea y esa boleta quedó
-    afuera, y su mapeo es lo que permite entender por qué—.
-    """
-    ahora = datetime.now()
-    datos = _leer_resumenes()
-    try:
-        ultima = datetime.strptime(_texto(datos.get("ultima_poda")), "%Y-%m-%d %H:%M:%S")
-        if (ahora - ultima).total_seconds() < 24 * 3600:
-            return
-    except ValueError:
-        pass   # nunca se podó, o la marca está ilegible: se poda ahora
-
-    vencidas = {n: e for n, e in (datos.get("resumenes") or {}).items()
-                if _resumen_vencido(n, e, ahora)}
-    pendientes = _numeraciones_pendientes(
-        conn, {b for e in vencidas.values() for b in e.get("boletas", [])},
-    ) if vencidas else set()
-
-    podadas, retenidas = [], []
-    with _lock_resumenes:
-        datos = _leer_resumenes()      # releer bajo el lock: el ciclo pudo tocarlo
-        resumenes = datos.setdefault("resumenes", {})
-        for numeracion_rc in vencidas:
-            entrada = resumenes.get(numeracion_rc)
-            if entrada is None:
-                continue
-            if any(b in pendientes for b in entrada.get("boletas", [])):
-                retenidas.append(numeracion_rc)
-                continue
-            resumenes.pop(numeracion_rc, None)
-            podadas.append(numeracion_rc)
-        datos["ultima_poda"] = ahora.strftime("%Y-%m-%d %H:%M:%S")
-        _guardar_resumenes(datos)
-
-    if podadas:
-        logger.info(
-            "Poda de %s: se sacaron %d resumen(es) resueltos de mas de %d dias; "
-            "quedan %d.", os.path.basename(_RESUMENES_PATH), len(podadas),
-            DIAS_RETENCION_RESUMENES, len(resumenes),
-        )
-    if retenidas:
-        logger.warning(
-            "%d resumen(es) viejos se conservan porque todavia tienen boletas en "
-            "enviado=0: %s", len(retenidas), ", ".join(retenidas[:_MAX_BLOQUEADOS_LOG]),
-        )
-
-
-def _nombre_situ_rc(situ: str) -> str:
-    """
-    Nombre del estado tal como se lee en un resumen, no en un comprobante.
-
-    _NOMBRE_SITU traduce el '05' como "anulado", que es lo que significa para una
-    factura. En un resumen ese estado lo deja el SFS cuando la consulta del ticket
-    no le sirvio, y nada se anulo: mostrar "anulado" manda a buscar algo que no
-    paso, justo en el aviso que existe para orientar a quien lo lee.
-    """
-    if situ == "05":
-        return "05, consulta del ticket sin resolver"
-    return _NOMBRE_SITU.get(situ, situ)
-
-
-def _reportar_resumenes_trabados(ruc_emisor: str):
-    """
-    Avisa por cada resumen que retiene boletas y no termina de resolverse.
-
-    _avisar_resumen_sin_rastro() ya cubre el resumen que desaparecio de la bandeja
-    del SFS, pero no el que sigue ahi en un estado que no avanza. Ese caso no
-    generaba una sola linea: los resumenes no son filas de Comprobantes, asi que
-    nunca llegan al bloque de BLOQUEADOS que arma el ciclo, y el unico rastro era el
-    conteo de pendientes sin nada que lo explicara.
-
-    Es exactamente lo que dejo pasar el incidente del 2026-09-06: siete resumenes
-    trabados retuvieron 1239 boletas durante 12 horas sin un solo WARNING.
-
-    Se avisa desde _GRACIA_REGISTRO_RC_SEG para no gritar por un resumen que acaba de
-    generarse y todavia esta en curso normal.
-    """
-    en_vuelo = _docs_en_vuelo(ruc_emisor)
-    trabados = []
-    for numeracion_rc, entrada in _leer_resumenes().get("resumenes", {}).items():
-        situ, obse = en_vuelo.get((_TIPO_RC, numeracion_rc), ("", ""))
-        if not situ or situ in _ESTADOS_CERRADOS:
-            continue          # sin rastro lo cubre _avisar_resumen_sin_rastro; cerrado no molesta
-        try:
-            generado = datetime.strptime(entrada.get("generado", ""), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-        horas = (datetime.now() - generado).total_seconds() / 3600
-        if horas * 3600 < _GRACIA_REGISTRO_RC_SEG:
-            continue
-        trabados.append((numeracion_rc, situ, len(entrada.get("boletas", [])), horas, obse))
-
-    if not trabados:
-        return
-    retenidas = sum(t[2] for t in trabados)
-    logger.warning(
-        "%d resumen(es) sin resolverse retienen %d boleta(s), que no se pueden "
-        "reagrupar hasta que se cierren:", len(trabados), retenidas,
-    )
-    for numeracion_rc, situ, cuantas, horas, obse in sorted(trabados, key=lambda t: -t[3]):
-        logger.warning(
-            "    %s [%s] — %d boleta(s), %.1f h sin cerrar: %s",
-            numeracion_rc, _nombre_situ_rc(situ), cuantas, horas, obse or "sin detalle",
-        )

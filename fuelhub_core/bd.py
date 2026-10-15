@@ -95,14 +95,18 @@ SELECT COUNT(*) AS pendientes
 # campos no iban en el payload, pero mandarla hoy sería un 400
 # PARAMETROS_INVALIDOS garantizado. Quedan pendientes (pdf_enviado sigue en 0)
 # hasta que el dato se complete.
+# enviado=1: se espera a que facturador-api ya haya cerrado el comprobante
+# (para factura/nota, con su CDR disponible; para boleta, firmada) antes de
+# subir nada — ver aplicacion/ciclo_pdf.py.
 _SQL_PENDIENTES_PDF = """
-SELECT c.id, c.numeracion_comprobante, c.pdf_bytes, c.tipo_comprobante,
+SELECT c.id, c.numeracion_comprobante, c.pdf_bytes, c.tipo_comprobante, c.xml_envio,
        CONVERT(varchar, c.fecha_emision, 23) AS fecha_emision,
        r.numero_documento                     AS numero_documento_receptor
   FROM Comprobantes c
   LEFT JOIN Receptores r ON r.id = c.ReceptorId
  WHERE c.pdf_bytes IS NOT NULL
    AND (c.pdf_enviado = 0 OR c.pdf_enviado IS NULL)
+   AND c.enviado = 1
    AND c.fecha_emision IS NOT NULL
    AND r.numero_documento IS NOT NULL
    AND r.numero_documento <> '0'
