@@ -7,7 +7,7 @@ firma pero no las envía solas, las agrupa en el resumen diario por su cuenta).
 """
 import logging
 
-from config import EMISOR_RUC_OVERRIDE, MOTIVO_NOTA_POR_DEFECTO, _TIPOS_NOTA, _MOTIVOS_NOTA
+from config import EMISOR_RUC_OVERRIDE, MOTIVO_NOTA_POR_DEFECTO, _TIPOS_NOTA, _TIPOS_VALIDOS, _MOTIVOS_NOTA
 from dominio.texto import _texto, _codigo, _tipo_sunat
 from dominio.montos import _base_e_igv, _desglosar_igv
 from dominio.monto_en_letras import numero_a_letras
@@ -155,6 +155,18 @@ def obtener_comprobantes_pendientes(conn):
         if not tipo_comp:
             _avisar_incompleto(
                 f["id"], "Comprobante id=%s sin tipo reconocible; no se emite.", f["id"],
+            )
+            continue
+        if tipo_comp not in _TIPOS_VALIDOS:
+            # Fuera de alcance: la tabla de origen guarda en la misma columna
+            # otros tipos de documento (guías, liquidaciones, lo que sea) que
+            # esta aplicación nunca maneja. Se descarta ANTES de construir el
+            # payload — mandarlo sería un rechazo seguro de facturador-api que
+            # además quema los 3 reintentos hasta bloquearlo por nada.
+            _avisar_incompleto(
+                f["id"],
+                "Comprobante %s de tipo '%s' fuera de alcance (solo se emiten %s); no se envía.",
+                f["numeracion_comprobante"] or f["id"], tipo_comp, ", ".join(sorted(_TIPOS_VALIDOS)),
             )
             continue
         faltantes = _validar_campos_obligatorios(f)

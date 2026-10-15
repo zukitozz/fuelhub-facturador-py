@@ -101,6 +101,15 @@ _REPORTE_FACTURAS_PATH = os.path.join(_BASE, "reporte_facturas.json")
 # ciclos y volcarlos todos cada 60s ahoga el resto del log.
 _MAX_BLOQUEADOS_LOG = 10
 
+# Tipos que facturador-api acepta (mismo catálogo que su propia validación,
+# _TIPOS_VALIDOS en su app/esquemas.py). La tabla de origen suele guardar en la
+# misma columna otros tipos de documento que esta aplicación nunca maneja —
+# guías, liquidaciones, lo que sea—, y mandarlos sería un rechazo seguro que
+# además quema los 3 reintentos hasta bloquearlos por nada: se descartan acá,
+# antes de intentar nada, igual que hacía el daemon con el SFS local
+# ("fuera de alcance", ver historial de aplicacion/ciclo_generacion.py).
+_TIPOS_VALIDOS = {"01", "03", "07", "08"}
+
 # Tipos de nota (SUNAT 07/08) — se usa para saber cuándo hace falta armar el
 # objeto 'referencia' del payload (ver aplicacion/lecturas.py).
 _TIPOS_NOTA = {"07", "08"}

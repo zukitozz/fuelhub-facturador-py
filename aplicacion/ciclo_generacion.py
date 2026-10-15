@@ -472,12 +472,18 @@ def ciclo_generacion():
             except Exception:
                 logger.exception("Error procesando %s", numeracion)
 
-        if bloqueados_ahora:
+        # Solo se avisan los bloqueados que siguen apareciendo en pendientes():
+        # uno que ya no vuelve a aparecer (ej. un tipo fuera de alcance que se
+        # empezó a filtrar en el origen) no tiene nada más que alguien pueda
+        # corregir, y quedaría avisándose para siempre sin ninguna acción posible.
+        numeraciones_pendientes = {c["numeracion_comprobante"] for c in pendientes}
+        bloqueados_vigentes = [n for n in bloqueados_ahora if n in numeraciones_pendientes]
+        if bloqueados_vigentes:
             logger.warning(
                 "%d comprobante(s) bloqueados (agotaron %d reenvíos) — requieren "
                 "intervención manual: %s",
-                len(bloqueados_ahora), MAX_REINTENTOS_RECHAZO,
-                ", ".join(list(bloqueados_ahora)[:_MAX_BLOQUEADOS_LOG]),
+                len(bloqueados_vigentes), MAX_REINTENTOS_RECHAZO,
+                ", ".join(bloqueados_vigentes[:_MAX_BLOQUEADOS_LOG]),
             )
 
         if procesados and fallos_infra == 0:
