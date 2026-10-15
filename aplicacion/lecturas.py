@@ -150,6 +150,7 @@ def obtener_comprobantes_pendientes(conn):
     """
     filas = _bd().pendientes(conn)
     pendientes = []
+    fuera_de_alcance = 0
     for f in filas:
         tipo_comp = _tipo_sunat(f["tipo_comprobante"] or f["tipo_enum"])
         if not tipo_comp:
@@ -162,12 +163,11 @@ def obtener_comprobantes_pendientes(conn):
             # otros tipos de documento (guías, liquidaciones, lo que sea) que
             # esta aplicación nunca maneja. Se descarta ANTES de construir el
             # payload — mandarlo sería un rechazo seguro de facturador-api que
-            # además quema los 3 reintentos hasta bloquearlo por nada.
-            _avisar_incompleto(
-                f["id"],
-                "Comprobante %s de tipo '%s' fuera de alcance (solo se emiten %s); no se envía.",
-                f["numeracion_comprobante"] or f["id"], tipo_comp, ", ".join(sorted(_TIPOS_VALIDOS)),
-            )
+            # además quema los 3 reintentos hasta bloquearlo por nada. No es
+            # un dato que alguien vaya a corregir, así que no se reporta fila
+            # por fila (eso era puro ruido en el log, un WARNING por cada una
+            # en cada corrida): se cuenta y se informa una sola vez al final.
+            fuera_de_alcance += 1
             continue
         faltantes = _validar_campos_obligatorios(f)
         if faltantes:
@@ -199,4 +199,9 @@ def obtener_comprobantes_pendientes(conn):
                 continue   # ya se avisó en _completar_referencia_nota
             comp["referencia"] = referencia
         pendientes.append(comp)
+    if fuera_de_alcance:
+        logger.info(
+            "%d comprobante(s) de tipo fuera de alcance (solo se emiten %s); se descartan sin reintento.",
+            fuera_de_alcance, ", ".join(sorted(_TIPOS_VALIDOS)),
+        )
     return pendientes
