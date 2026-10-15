@@ -1,4 +1,4 @@
-"""Parseo de fechas de BD. La corrección de zona horaria vive en main.py
+"""Parseo de fechas de BD. La corrección de zona horaria vive en utilidades_timer.py
 (fecha_local/detectar_desfase_bd): necesita leer el reloj de la BD, que es I/O."""
 from datetime import datetime
 

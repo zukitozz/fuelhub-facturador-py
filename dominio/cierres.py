@@ -1,6 +1,6 @@
 """
 Payloads de cierre de turno y cierre de día para FuelHub core: solo formato, sin
-tocar la BD ni la red — igual que comprobante.py y resumen_diario.py.
+tocar la BD ni la red — igual que comprobante.py.
 """
 from datetime import date, timedelta
 

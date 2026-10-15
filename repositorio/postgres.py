@@ -191,3 +191,20 @@ def guardar_error_varios(conn, numeraciones: list, detalle: str) -> int:
         'UPDATE public."Factura" SET errors=%s WHERE "numeracionComprobante" = ANY(%s)',
         (detalle, list(numeraciones)),
     )
+
+
+def guardar_respuesta(conn, numeracion: str, hash_: str, qr: str, url: str, xml_envio: str) -> int:
+    """
+    Guarda lo que facturador-api devolvió al aceptar un comprobante (hash, QR,
+    url de consulta, payload enviado) — ver sqlserver.py para el porqué de
+    cada campo. OJO: nombres de columna en camelCase asumidos por analogía con
+    el resto de este esquema (codigoHash/cadenaParaCodigoQr/url/xmlEnvio) —
+    no confirmados contra la base real de Prisma; verificar/ajustar antes de
+    depender de esto en una instalación que use este adaptador.
+    """
+    return _escribir(
+        conn,
+        'UPDATE public."Factura" SET "codigoHash"=%s, "cadenaParaCodigoQr"=%s, url=%s, "xmlEnvio"=%s '
+        ' WHERE "numeracionComprobante"=%s',
+        (hash_, qr, url, xml_envio, numeracion),
+    )

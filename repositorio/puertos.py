@@ -6,7 +6,7 @@ ejecución —repositorio.elegir() sigue devolviendo el módulo tal cual—; es 
 en código de lo que el README ya describe en prosa, para que un adaptador nuevo tenga
 dónde chequear la forma exacta de cada operación.
 
-Cada adaptador (postgres.py, sqlserver.py) es un MÓDULO que expone estas diez
+Cada adaptador (postgres.py, sqlserver.py) es un MÓDULO que expone estas once
 funciones a nivel de archivo, no una clase con instancias — por eso el puerto se
 declara con @staticmethod en cada método: así el Protocol describe fielmente
 "conectar(url, timeout)", sin un "self" que el módulo real nunca tiene.
@@ -60,4 +60,11 @@ class RepositorioComprobantes(Protocol):
 
     @staticmethod
     def guardar_error_varios(conn, numeraciones: list, detalle: str) -> int:
+        ...
+
+    @staticmethod
+    def guardar_respuesta(conn, numeracion: str, hash_: str, qr: str, url: str, xml_envio: str) -> int:
+        """Lo que facturador-api devolvió al aceptar: hash, QR, url de
+        consulta (nunca vacía: fuelhub-local la usa como marca de "ya
+        aceptado") y el payload enviado, para auditoría."""
         ...

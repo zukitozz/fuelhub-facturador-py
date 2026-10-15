@@ -1,5 +1,4 @@
 """Primitivas de texto: limpiar valores de BD y traducir el tipo de comprobante."""
-import re
 
 # La aplicación guarda el tipo por nombre, no con el código de SUNAT. NOTA_VENTA no
 # es un comprobante electrónico —es un documento interno— y por eso no se mapea:
@@ -24,16 +23,6 @@ def _codigo(valor, defecto: str = "") -> str:
     """Código SUNAT de dos dígitos: '1' -> '01'. Devuelve el respaldo si no hay dato."""
     texto = _texto(valor)
     return texto.zfill(2) if texto else defecto
-
-
-def _campo_pipe(valor, defecto: str = "") -> str:
-    """Texto apto para un archivo delimitado por pipes."""
-    return re.sub(r"[|\r\n\t]+", " ", _texto(valor)).strip() or defecto
-
-
-def _marcas(cantidad: int) -> str:
-    """Placeholders '?,?,?' para un IN de SQL."""
-    return ",".join("?" * cantidad)
 
 
 def _tipo_sunat(valor) -> str:

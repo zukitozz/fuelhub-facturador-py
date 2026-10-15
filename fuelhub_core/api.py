@@ -141,12 +141,11 @@ def subir_pdf_comprobante(
     fecha real de emisión del comprobante, no la de esta subida— y de ahí sale
     la key {yyyy}/{mm}/{dd} del lado de FuelHub core.
 
-    xml_bytes/cdr_bytes son OPCIONALES (xmlBase64/cdrBase64 del contrato): si
-    no están disponibles todavía (CDR sin volver de SUNAT, por ejemplo) se
-    pasa None y quedan afuera del payload sin afectar la subida del PDF — ver
-    sfs/bd.py:leer_xml_firmado/leer_cdr_xml, que ya entregan el XML/CDR
-    extraído y listo (FuelHub core no desempaqueta el .zip del CDR, así que
-    acá nunca se manda el zip crudo).
+    xml_bytes/cdr_bytes son OPCIONALES (xmlBase64/cdrBase64 del contrato) —
+    ver aplicacion/ciclo_pdf.py: el XML sale de Comprobantes.xml_envio
+    (guardado por ciclo_generacion.py al recibirlo de facturador-api) y el CDR
+    se pide fresco con un GET a facturador-api, solo para factura/nota (una
+    boleta nunca tiene CDR propio).
     """
     ruta = f"v1/comprobantes/{urllib.parse.quote(numeracion, safe='')}/pdf"
     payload = {

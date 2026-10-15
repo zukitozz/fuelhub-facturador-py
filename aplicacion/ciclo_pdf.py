@@ -1,17 +1,26 @@
 """
-Caso de uso del hilo PDF: envía a FuelHub core el PDF de los comprobantes que
-la aplicación ya generó (Comprobantes.pdf_bytes) y que todavía no se subieron
+Caso de uso del hilo PDF: envía a FuelHub core el PDF de los comprobantes ya
+aceptados (Comprobantes.pdf_bytes, enviado=1) y que todavía no se subieron
 (pdf_enviado = 0 o NULL) — ver fuelhub-core: services/ingest-comprobante-pdf,
 que lo sube a S3 para que la página web de consulta lo sirva. No participa del
 flujo de facturación con SUNAT —es best-effort para esa consulta— así que una
 falla acá nunca detiene el ciclo ni se propaga fuera de él.
 
-De paso, si para ese momento ya existen el XML firmado y/o el CDR en disco, se
-adjuntan al mismo PUT (xmlBase64/cdrBase64 — ambos opcionales en el contrato).
-Es oportunista, no un segundo intento: si el CDR todavía no volvió de SUNAT
-cuando se sube el PDF, esa subida queda sin cdrBase64 para siempre (pdf_enviado
-ya quedó en 1) — aceptable porque el contrato los trata como aditivos y sin
-apuro, no como algo que este ciclo deba garantizar.
+Junto con el PDF, sube el XML y (para factura/nota) el CDR:
+  - El XML ya está guardado en Comprobantes.xml_envio desde que
+    aplicacion/ciclo_generacion.py lo recibió de facturador-api (columna
+    `incluir=xml` del POST) — acá no se vuelve a pedir, para una boleta ya no
+    se podría: una vez que el resumen diario la consume, su propia consulta
+    (GET) empieza a devolver 404.
+  - El CDR, en cambio, se pide fresco acá con un GET, solo para factura/nota:
+    una boleta nunca tiene CDR propio (es el del resumen que la agrupa, y
+    asociarlo por boleta no está resuelto del lado de facturador-api) — ver
+    decisión explícita de dejarlas sin CDR en este envío.
+
+_SQL_PENDIENTES_PDF ya exige enviado=1, así que para una boleta esta fila solo
+aparece una vez que quedó firmada (su propio "generado" ya cuenta como cierre,
+ver ciclo_generacion.py) — no hace falta esperar a ningún resumen para subir
+su PDF+XML.
 
 Mismo patrón que ciclo_cierres.py: mismas credenciales OAuth2
 (FUELHUB_CORE_CLIENT_ID/SECRET), mismo chequeo de motor.
@@ -24,11 +33,23 @@ from dominio.texto import _codigo
 from aplicacion.bd_app import conectar_bd
 from fuelhub_core.bd import codigo_estacion, pendientes_pdf, marcar_pdf_enviado
 from fuelhub_core.api import subir_pdf_comprobante
-from sfs.bd import leer_xml_firmado, leer_cdr_xml
+from fuelhub_api.cliente import consultar_comprobante
 
 logger = logging.getLogger(__name__)
 
 _avisado_sin_credenciales = False
+
+# Tipo de boleta: nunca tiene CDR propio, no tiene sentido pedírselo a facturador-api.
+_TIPO_BOLETA = "03"
+
+
+def _obtener_cdr(ruc: str, tipo: str, numeracion: str) -> str | None:
+    """CDR fresco para factura/nota — None si todavía no está (se reintenta
+    en el próximo ciclo) o si no se pudo consultar."""
+    resp = consultar_comprobante(ruc, f"{tipo}-{numeracion}")
+    if resp.status != 200 or not resp.body:
+        return None
+    return resp.body.get("cdr")
 
 
 def ciclo_pdf():
@@ -59,8 +80,18 @@ def ciclo_pdf():
             numeracion = fila["numeracion_comprobante"]
             try:
                 tipo = _codigo(fila["tipo_comprobante"], "01")
-                xml_bytes = leer_xml_firmado(EMISOR_RUC_OVERRIDE, tipo, numeracion)
-                cdr_bytes = leer_cdr_xml(EMISOR_RUC_OVERRIDE, tipo, numeracion)
+                xml = fila["xml_envio"]
+                xml_bytes = xml.encode("utf-8") if xml else None
+
+                cdr_bytes = None
+                if tipo != _TIPO_BOLETA:
+                    cdr = _obtener_cdr(EMISOR_RUC_OVERRIDE, tipo, numeracion)
+                    if not cdr:
+                        # Todavía sin CDR: se reintenta en el próximo ciclo,
+                        # no se sube el PDF a medias.
+                        continue
+                    cdr_bytes = cdr.encode("utf-8")
+
                 if subir_pdf_comprobante(
                     codigo, EMISOR_RUC_OVERRIDE, numeracion, bytes(fila["pdf_bytes"]),
                     fila["numero_documento_receptor"], fila["fecha_emision"],

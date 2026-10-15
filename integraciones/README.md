@@ -6,25 +6,24 @@ un puerto por operación, un adaptador por destino posible, elegido por configur
 
 ## Por qué existe
 
-El daemon solo sabía hablar con el SFS y con SUNAT. La primera integración prevista
-—subir a S3 el PDF del comprobante ya aceptado— no tiene nada que ver con ese flujo:
-no necesita conocer el SFS, ni DATA, ni RPTA. Meterla ahí adentro habría acoplado dos
-cosas que cambian por razones distintas. Este paquete es el lugar para eso y para lo
-que siga (el próximo previsto: cierres de turno/día a otro endpoint).
+La primera integración prevista —subir a S3 el PDF del comprobante ya aceptado— no
+tiene nada que ver con el flujo de facturación en sí. Meterla ahí adentro habría
+acoplado dos cosas que cambian por razones distintas. Este paquete es el lugar para
+eso y para lo que siga.
 
 ## El punto de enganche
 
-`main.py`, dentro de `_barrer_rpta()`, justo cuando un CDR de aceptación ya se
-reflejó en la BD de la app y antes de archivarlo en `RPTA/procesados/`. Es el único
-lugar donde el daemon sabe con certeza que SUNAT aceptó ese comprobante (o ese
-resumen diario) y que la app ya lo tiene marcado como enviado.
+`aplicacion/ciclo_generacion.py`, justo cuando facturador-api confirma que un
+comprobante (o un resumen diario) quedó aceptado y ya se reflejó en la BD de la app
+(`_cerrar_aceptado`). Es el lugar donde el daemon sabe con certeza que SUNAT aceptó
+ese comprobante y que la app ya lo tiene marcado como enviado.
 
-La llamada al puerto va envuelta en su propio try/except en `main.py`
-(`_notificar_comprobante_aceptado`): una falla acá **nunca** debe impedir que el CDR
-se archive ni que el ciclo siga. Todo lo que vive en `integraciones/` es best-effort
-por definición — lo que no lo sea (por ejemplo, algo de lo que dependa declarar
-correctamente un comprobante ante SUNAT) no pertenece acá, pertenece al flujo
-principal en `main.py`.
+La llamada al puerto va envuelta en su propio try/except en
+`_notificar_comprobante_aceptado`: una falla acá **nunca** debe impedir que el
+comprobante se cierre ni que el ciclo siga. Todo lo que vive en `integraciones/` es
+best-effort por definición — lo que no lo sea (por ejemplo, algo de lo que dependa
+declarar correctamente un comprobante ante SUNAT) no pertenece acá, pertenece al
+flujo principal en `aplicacion/ciclo_generacion.py`.
 
 ## `NotificadorComprobanteAceptado` (`puertos.py`)
 
@@ -53,7 +52,6 @@ esta integración nunca puede ser la causa de que se deje de facturar.
 
 Un archivo acá con una clase que implemente el puerto que corresponda, y una entrada
 en `_ADAPTADORES` (`__init__.py`). Por ejemplo, para S3: qué credenciales usa, de
-dónde saca el PDF (todavía sin definir al momento de escribir esto — ver el propio
-`main.py` para el estado del punto de enganche) y qué hace si el bucket no responde
-(nunca debería propagar la excepción más allá de `notificar()`; ya la atrapa quien
-llama, pero un reintento o backoff propio, si hace falta, vive acá adentro).
+dónde saca el PDF y qué hace si el bucket no responde (nunca debería propagar la
+excepción más allá de `notificar()`; ya la atrapa quien llama, pero un reintento o
+backoff propio, si hace falta, vive acá adentro).

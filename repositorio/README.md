@@ -1,8 +1,7 @@
 # Qué necesita el facturador de tu base de datos
 
-El daemon no sabe con qué base está hablando. Pide **diez operaciones** y espera que
-cada una devuelva siempre las mismas claves, vengan de PostgreSQL, de SQL Server o
-—si algún día se implementa— de una API.
+El daemon no sabe con qué base está hablando. Pide **once operaciones** y espera que
+cada una devuelva siempre las mismas claves, vengan de PostgreSQL o de SQL Server.
 
 Este documento es el contrato. Sirve para dos cosas: escribir el adaptador de un
 cliente con su propio esquema, y saber qué hay que entregarle al facturador si la
@@ -26,7 +25,7 @@ ejecución, es la versión tipada de lo que sigue en prosa acá abajo.
 
 ---
 
-## Las diez operaciones
+## Las once operaciones
 
 ```python
 conectar(url, timeout)                          -> conexión
@@ -39,12 +38,14 @@ marcar_enviados(conn, numeraciones, limpiar_error=True)   -> filas afectadas
 marcar_enviado(conn, numeracion, enviado=True, limpiar_error=True)
 guardar_error(conn, numeracion, detalle)        -> filas afectadas
 guardar_error_varios(conn, numeraciones, detalle)
+guardar_respuesta(conn, numeracion, hash, qr, url, xml_envio)   -> filas afectadas
 ```
 
 ## `pendientes(conn)` — el corazón del contrato
 
-Todo lo que todavía no se envió, **sin distinguir tipo**: el daemon separa después
-los que van de a uno de las boletas que van en el resumen diario.
+Todo lo que todavía no se envió, **sin distinguir tipo**: cada comprobante —boleta
+incluida— se manda individualmente a facturador-api (ver aplicacion/ciclo_generacion.py
+del daemon); es la propia API la que, para una boleta, firma pero no envía sola.
 
 Cada fila es un diccionario con estas catorce claves. Las que faltan tienen que venir
 en `None`, no ausentes: si falta la clave, el daemon revienta con `KeyError` recién
@@ -122,19 +123,37 @@ medir el desfase, porque SUNAT espera la fecha de emisión en hora local del emi
 muchos servidores corren en UTC. Si tu base ya está en hora local, devolvés la misma
 y el desfase da cero.
 
-## Las cuatro escrituras
+## Las escrituras
 
-Marcan el comprobante como enviado o le guardan el motivo de un rechazo. Todas
-devuelven **cuántas filas afectaron** — el daemon lo usa para saber si el comprobante
-existía.
+Marcan el comprobante como enviado, le guardan el motivo de un rechazo, o guardan
+la respuesta de facturador-api. Todas devuelven **cuántas filas afectaron** — el
+daemon lo usa para saber si el comprobante existía.
 
-`marcar_enviados` y `guardar_error_varios` reciben una **lista**: cierran de una vez
-todas las boletas de un resumen diario. En PostgreSQL eso es `= ANY(%s)`; en SQL
-Server hay que armar un `IN (?,?,…)` porque no existe `ANY(lista)`.
+`marcar_enviados` y `guardar_error_varios` reciben una **lista** — quedan del
+diseño anterior (cerrar de una vez todas las boletas de un resumen diario armado
+localmente); el daemon de hoy no las llama porque cada comprobante, boleta
+incluida, se cierra de a uno vía `marcar_enviado`/`guardar_error`. Se mantienen en
+el contrato por si hiciera falta un cierre en lote más adelante. En PostgreSQL el
+`IN` de una lista es `= ANY(%s)`; en SQL Server hay que armarlo a mano con
+`IN (?,?,…)` porque no existe `ANY(lista)`.
 
 `limpiar_error=True` borra el motivo de rechazo anterior al aceptar el comprobante:
 si venía rechazado y ahora SUNAT lo aceptó, ese motivo ya no aplica. Al devolverlo a
 la cola para reintentar se usa `False`, para que el motivo siga a la vista.
+
+## `guardar_respuesta(conn, numeracion, hash, qr, url, xml_envio)`
+
+Lo que facturador-api devolvió al aceptar un comprobante:
+
+| Parámetro | Va en la columna | Qué es |
+|---|---|---|
+| `hash` | `codigo_hash` | `DigestValue` de la firma XML-DSig del comprobante |
+| `qr` | `cadena_para_codigo_qr` | Los 10 campos del QR de SUNAT, ya armados y separados por `\|` |
+| `url` | `url` | `{FACTURADOR_API_URL}/empresas/{ruc}/comprobantes/{codigo}` — nunca queda vacía: el sistema de origen la usa como marca de "ya aceptado" |
+| `xml_envio` | `xml_envio` | El XML UBL firmado del comprobante, como texto — lo devuelve facturador-api (`incluir=xml`) en la misma respuesta que acepta el envío; es la única oportunidad de guardarlo para una boleta, cuya consulta individual da 404 apenas el resumen diario la consume |
+
+Como el resto de las escrituras: con parámetros, nunca con texto concatenado —una
+razón social con apóstrofe (`O'BRIEN`) rompe un `UPDATE` armado a mano.
 
 ---
 
