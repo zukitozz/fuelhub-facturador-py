@@ -179,6 +179,19 @@ cg.ciclo_generacion()
 check(CAP["marcado_enviado"] == ["F002-000009"], "el ciclo siguiente lo cierra solo, vía GET")
 check("F002-000009" not in envio_api.esperando_cdr(), "sale de la cola de espera")
 
+# --- caso 8b: 404 consultando el CDR -> deja de reintentar para siempre ----
+reset()
+cg.obtener_comprobantes_pendientes = lambda conn: [_comp("F002-000011")]
+cg.cliente.crear_comprobante = lambda ruc, payload, numeracion="": RespuestaAPI(
+    201, {"codigo": "01-F002-000011", "estado": "enviado", "des_obse": "-"},
+)
+cg.ciclo_generacion()
+check("F002-000011" in envio_api.esperando_cdr(), "queda en la cola de 'esperando CDR'")
+cg.obtener_comprobantes_pendientes = lambda conn: []
+cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(404, None)
+cg.ciclo_generacion()
+check("F002-000011" not in envio_api.esperando_cdr(), "un 404 lo saca de la cola en vez de reintentar para siempre")
+
 # --- caso 9: estado 'error' -> backoff, SIN contar como rechazo ------------
 reset()
 cg.obtener_comprobantes_pendientes = lambda conn: [_comp("F002-000010")]

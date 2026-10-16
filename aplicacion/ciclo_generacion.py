@@ -251,6 +251,16 @@ def _resolver_esperando_cdr(ruc: str):
     for numeracion, tipo in pendientes.items():
         codigo = _codigo_api(tipo, numeracion)
         resp = cliente.consultar_comprobante(ruc, codigo)
+        if resp.status == 404:
+            # facturador-api ya no tiene este comprobante — no es "todavía no
+            # hay CDR", es que dejó de existir ahí (p.ej. se reseteó su base).
+            # Reintentarlo cada ciclo para siempre no lo iba a resolver nunca.
+            logger.warning(
+                "%s ya no existe en facturador-api (404 consultando su CDR); "
+                "se deja de reintentar.", codigo,
+            )
+            envio_api.quitar_esperando_cdr(numeracion)
+            continue
         if resp.status != 200 or not resp.body:
             continue
         estado = resp.body.get("estado")
