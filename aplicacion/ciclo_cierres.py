@@ -49,6 +49,13 @@ def _enviar_dias(conn, codigo: str, admin: dict) -> int:
             dia["admin_codigo"] = admin.get("codigo")
             dia["admin_nombre"] = admin.get("nombre")
             dia["cierres_turno_ids"] = uuids_cierreturno_de_dia(conn, dia["id"])
+            if not dia["total"] and not dia["cierres_turno_ids"]:
+                # Día sin movimiento: FuelHub core lo rechaza con 400 siempre
+                # (nada que cerrar), así que insistir cada ciclo no lo iba a
+                # resolver nunca — se da por enviado sin mandarlo.
+                logger.info("Cierre de día %s sin turnos ni total; se omite.", dia["id"])
+                marcar_enviado_cierredia(conn, dia["id"])
+                continue
             payload = payload_cierre_dia(dia, CIERRE_DIA)
             if enviar_cierre_dia(dia["id"], payload) is not None:
                 marcar_enviado_cierredia(conn, dia["id"])

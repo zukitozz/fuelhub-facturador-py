@@ -179,6 +179,19 @@ cg.ciclo_generacion()
 check(CAP["marcado_enviado"] == ["F002-000009"], "el ciclo siguiente lo cierra solo, vía GET")
 check("F002-000009" not in envio_api.esperando_cdr(), "sale de la cola de espera")
 
+# --- caso 8b: 404 consultando el CDR -> deja de reintentar para siempre ----
+reset()
+cg.obtener_comprobantes_pendientes = lambda conn: [_comp("F002-000011")]
+cg.cliente.crear_comprobante = lambda ruc, payload, numeracion="": RespuestaAPI(
+    201, {"codigo": "01-F002-000011", "estado": "enviado", "des_obse": "-"},
+)
+cg.ciclo_generacion()
+check("F002-000011" in envio_api.esperando_cdr(), "queda en la cola de 'esperando CDR'")
+cg.obtener_comprobantes_pendientes = lambda conn: []
+cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(404, None)
+cg.ciclo_generacion()
+check("F002-000011" not in envio_api.esperando_cdr(), "un 404 lo saca de la cola en vez de reintentar para siempre")
+
 # --- caso 9: estado 'error' -> backoff, SIN contar como rechazo ------------
 reset()
 cg.obtener_comprobantes_pendientes = lambda conn: [_comp("F002-000010")]
@@ -215,6 +228,51 @@ cg.ciclo_generacion()
 check(set(marcados_false) == {"B001-000001", "B001-000002"}, f"las boletas del resumen rechazado vuelven a enviado=0 ({marcados_false})")
 check("RC-20261010-001" not in envio_api.resumenes_pendientes(), "el resumen sale de la cola de pendientes")
 cg._bd = lambda: FakeBD()   # se restaura para no afectar corridas futuras de este archivo
+
+# --- caso 11: falla guardar_respuesta -> no marca enviado, cierra por GET --
+reset()
+intentos_post = {"n": 0}
+def fake_post_cuenta(ruc, payload, numeracion=""):
+    intentos_post["n"] += 1
+    return RespuestaAPI(201, {"codigo": "01-F002-000012", "estado": "aceptado", "des_obse": "-",
+                              "hash": "H12==", "qr": "qr12"})
+cg.obtener_comprobantes_pendientes = lambda conn: [_comp("F002-000012")]
+cg.cliente.crear_comprobante = fake_post_cuenta
+cg._bd = lambda: type("FakeBDFalla", (), {
+    "guardar_respuesta": staticmethod(lambda conn, *a: -1),
+    "marcar_enviado":    staticmethod(FakeBD.marcar_enviado),
+    "guardar_error":     staticmethod(FakeBD.guardar_error),
+})()
+cg.ciclo_generacion()
+check(not CAP["marcado_enviado"], "no se marca enviado si falló el guardado de hash/qr/xml")
+check("F002-000012" in envio_api.en_vuelo(), "queda 'en vuelo' para resolverse por GET")
+check(intentos_post["n"] == 1, "un solo POST, no se reintenta en el mismo ciclo")
+
+# el próximo ciclo, con la BD ya funcionando, se resuelve con un GET —sin un segundo POST—:
+cg._bd = lambda: FakeBD()
+cg.obtener_comprobantes_pendientes = lambda conn: []
+cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(
+    200, {"codigo": codigo, "estado": "aceptado", "des_obse": "-", "hash": "H12==", "qr": "qr12"},
+)
+cg.ciclo_generacion()
+check(CAP["marcado_enviado"] == ["F002-000012"], "el ciclo siguiente lo cierra por GET")
+check(intentos_post["n"] == 1, "nunca hubo un segundo POST")
+cg._bd = lambda: FakeBD()
+
+# --- caso 12: resumen diario responde HTTP 200 (no 201) pero con numeracion_rc --
+reset()
+cg.obtener_comprobantes_pendientes = lambda conn: []
+llamados_resumen = {"n": 0}
+def fake_resumen_200(ruc):
+    llamados_resumen["n"] += 1
+    if llamados_resumen["n"] == 1:
+        return RespuestaAPI(200, {"numeracion_rc": "RC-20261018-001", "boletas": ["B001-000003"]})
+    return RespuestaAPI(201, {"mensaje": "No hay más boletas pendientes de resumir."})
+cg.cliente.crear_resumen_diario = fake_resumen_200
+cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(200, {"estado": "validando"})
+cg._ultima_fecha_resumen = None
+cg.ciclo_generacion()
+check("RC-20261018-001" in envio_api.resumenes_pendientes(), "un 200 con numeracion_rc se registra igual que un 201")
 
 if FALLAS:
     print(str(FALLAS) + ' FALLA(S)')

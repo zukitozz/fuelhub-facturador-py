@@ -156,10 +156,21 @@ def _cerrar_comprobante(conn, ruc: str, tipo: str, numeracion: str, body: dict):
     """
     codigo = _codigo_api(tipo, numeracion)
     url = _url_comprobante(ruc, codigo)
-    _escribir_bd(
+    filas = _escribir_bd(
         _bd().guardar_respuesta, conn, numeracion,
         body.get("hash"), body.get("qr"), url, body.get("xml") or "",
     )
+    if filas < 0:
+        # guardar_respuesta falló (ej. el XML no entra en la columna): NO se
+        # marca enviado sin haber guardado hash/qr/url/xml — para una boleta
+        # eso sería irrecuperable, su GET individual da 404 apenas el resumen
+        # la consume. Se deja "en vuelo": el próximo ciclo lo cierra con un
+        # GET en vez de volver a mandar el mismo POST.
+        logger.error(
+            "No se pudo guardar hash/qr/url/xml de %s en la BD; no se marca "
+            "enviado todavía.", codigo,
+        )
+        raise _FallaInfraestructura()
     _escribir_bd(_bd().marcar_enviado, conn, numeracion, True, True)
     envio_api.limpiar_rechazo(numeracion)
     envio_api.limpiar_espera_infra(numeracion)
@@ -237,6 +248,8 @@ def _resolver_pendientes_en_vuelo(ruc: str):
     for numeracion, tipo in pendientes.items():
         try:
             _resolver_ambiguo(ruc, tipo, numeracion)
+        except _FallaInfraestructura:
+            pass   # ya logueado en _cerrar_comprobante; se reintenta el próximo ciclo
         except Exception:
             logger.exception("Error resolviendo %s-%s en vuelo", tipo, numeracion)
 
@@ -251,6 +264,16 @@ def _resolver_esperando_cdr(ruc: str):
     for numeracion, tipo in pendientes.items():
         codigo = _codigo_api(tipo, numeracion)
         resp = cliente.consultar_comprobante(ruc, codigo)
+        if resp.status == 404:
+            # facturador-api ya no tiene este comprobante — no es "todavía no
+            # hay CDR", es que dejó de existir ahí (p.ej. se reseteó su base).
+            # Reintentarlo cada ciclo para siempre no lo iba a resolver nunca.
+            logger.warning(
+                "%s ya no existe en facturador-api (404 consultando su CDR); "
+                "se deja de reintentar.", codigo,
+            )
+            envio_api.quitar_esperando_cdr(numeracion)
+            continue
         if resp.status != 200 or not resp.body:
             continue
         estado = resp.body.get("estado")
@@ -259,6 +282,8 @@ def _resolver_esperando_cdr(ruc: str):
             try:
                 conn = conectar_bd()
                 _cerrar_comprobante(conn, ruc, tipo, numeracion, resp.body)
+            except _FallaInfraestructura:
+                pass   # ya logueado en _cerrar_comprobante; se reintenta el próximo ciclo
             finally:
                 if conn:
                     conn.close()
@@ -369,20 +394,31 @@ def _procesar_resumenes_diarios(ruc: str):
         if resp.status == 409:
             logger.warning("Tope diario de resúmenes alcanzado en facturador-api; se sigue mañana.")
             return
-        if resp.status != 201 or not resp.body:
-            logger.warning("No se pudo armar el resumen diario (HTTP %s); se reintenta otro día.", resp.status)
+        # 200 cuenta igual que 201: la API arma el resumen de todas formas (se
+        # vio en producción) — lo que importa es si el cuerpo trae numeracion_rc,
+        # no el código HTTP exacto.
+        if resp.status not in (200, 201) or not resp.body:
+            logger.warning(
+                "No se pudo armar el resumen diario (HTTP %s): %r; se reintenta otro día.",
+                resp.status, resp.body,
+            )
             return
         if "mensaje" in resp.body:
             logger.info("Sin boletas pendientes de resumir: %s", resp.body["mensaje"])
             return
         numeracion_rc = resp.body.get("numeracion_rc")
+        if not numeracion_rc:
+            logger.warning(
+                "Respuesta inesperada de /resumenes-diarios (HTTP %s, sin "
+                "numeracion_rc): %r", resp.status, resp.body,
+            )
+            return
         boletas = resp.body.get("boletas", [])
         logger.info(
             "Resumen diario %s armado (%d boleta(s)); se resuelve con consultas "
             "posteriores.", numeracion_rc, resp.body.get("cantidad_boletas", len(boletas)),
         )
-        if numeracion_rc:
-            envio_api.agregar_resumen_pendiente(numeracion_rc, boletas)
+        envio_api.agregar_resumen_pendiente(numeracion_rc, boletas)
 
 
 def _reencolar_boletas_de_resumen_rechazado(numeracion_rc: str, boletas: list):
