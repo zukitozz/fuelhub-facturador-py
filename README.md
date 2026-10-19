@@ -133,6 +133,17 @@ Python 3.10+, la base de la aplicación accesible (PostgreSQL o SQL Server), acc
 de red a `https://facturador.peru-hub.com` (o la URL que corresponda) y
 [PM2](https://pm2.keymetrics.io/) (opcional, para gestionar el proceso).
 
+**`xml_envio` tiene que ser `NVARCHAR(MAX)` (o `TEXT` en PostgreSQL), no un tipo
+acotado.** Un XML UBL firmado mide unos 11.000 caracteres; con la columna más
+chica (se vio en producción con `NVARCHAR(4000)`) el `UPDATE` de
+`guardar_respuesta` falla entero —no solo el XML: también se pierden hash, QR y
+url— de forma silenciosa si nadie revisa el log. Chequear esto antes de
+desplegar contra una base existente:
+
+```sql
+ALTER TABLE dbo.Comprobantes ALTER COLUMN xml_envio NVARCHAR(MAX) NULL;
+```
+
 ## De dónde salen los comprobantes
 
 El daemon no sabe con qué base está hablando. Pide siempre las mismas once
