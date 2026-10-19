@@ -43,13 +43,22 @@ _avisado_sin_credenciales = False
 _TIPO_BOLETA = "03"
 
 
-def _obtener_cdr(ruc: str, tipo: str, numeracion: str) -> str | None:
-    """CDR fresco para factura/nota — None si todavía no está (se reintenta
-    en el próximo ciclo) o si no se pudo consultar."""
+def _obtener_cdr(ruc: str, tipo: str, numeracion: str) -> tuple[str | None, bool]:
+    """
+    CDR fresco para factura/nota. Devuelve (cdr, agotado):
+      - (cdr, False): listo para subir.
+      - (None, False): todavía no está — se reintenta en el próximo ciclo.
+      - (None, True): facturador-api ya no tiene este comprobante (404) — no es
+        que falte el CDR, es que nunca va a existir (ej. un enviado=1 de antes
+        de usar facturador-api). Insistir cada ciclo para siempre no lo iba a
+        resolver nunca.
+    """
     resp = consultar_comprobante(ruc, f"{tipo}-{numeracion}")
+    if resp.status == 404:
+        return None, True
     if resp.status != 200 or not resp.body:
-        return None
-    return resp.body.get("cdr")
+        return None, False
+    return resp.body.get("cdr"), False
 
 
 def ciclo_pdf():
@@ -85,7 +94,15 @@ def ciclo_pdf():
 
                 cdr_bytes = None
                 if tipo != _TIPO_BOLETA:
-                    cdr = _obtener_cdr(EMISOR_RUC_OVERRIDE, tipo, numeracion)
+                    cdr, agotado = _obtener_cdr(EMISOR_RUC_OVERRIDE, tipo, numeracion)
+                    if agotado:
+                        logger.warning(
+                            "%s-%s no existe en facturador-api (404 pidiendo su "
+                            "CDR); se da por no subible y se deja de reintentar.",
+                            tipo, numeracion,
+                        )
+                        marcar_pdf_enviado(conn, comprobante_id)
+                        continue
                     if not cdr:
                         # Todavía sin CDR: se reintenta en el próximo ciclo,
                         # no se sube el PDF a medias.

@@ -312,11 +312,21 @@ def _procesar_comprobante(conn, ruc: str, comp: dict):
             # drama pero tampoco cuesta nada guardarlo ya), sin marcar enviado.
             xml = resp.body.get("xml")
             if xml:
-                _escribir_bd(
+                filas = _escribir_bd(
                     _bd().guardar_respuesta, conn, numeracion,
                     resp.body.get("hash"), resp.body.get("qr"),
                     _url_comprobante(ruc, codigo), xml,
                 )
+                if filas < 0:
+                    # No se quedó sin marcar enviado (nunca se marca acá), pero
+                    # el XML que vino en esta respuesta se perdió igual — no
+                    # hay otra oportunidad de conseguirlo si después resulta
+                    # ser una boleta que termina en "generado" sin volver a
+                    # traer XML en el cuerpo.
+                    logger.error(
+                        "No se pudo guardar el XML de %s (estado %s) en la BD.",
+                        codigo, estado,
+                    )
             envio_api.agregar_esperando_cdr(numeracion, tipo)
             envio_api.olvidar_en_vuelo(numeracion)
             return
