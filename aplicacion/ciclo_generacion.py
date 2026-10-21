@@ -4,18 +4,23 @@ manda cada comprobante pendiente a facturador-api (el servicio en la nube que
 firma y envía a SUNAT a través de SFS) — reemplaza al SFS local que este
 daemon manejaba antes directamente escribiendo archivos para un proceso Java.
 
-Boletas: facturador-api las firma pero nunca las envía solas — quedan a la
-espera del resumen diario, que este mismo ciclo dispara una vez al día (ver
-_procesar_resumen_diario_si_toca).
+Boletas: facturador-api las firma pero nunca las envía solas — quedan
+"generado" (que acá se trata como cierre) hasta que la propia API arma y
+declara el resumen diario sola, todos los días a las 00:10 hora de Lima (spec
+§3). Este daemon YA NO dispara ese resumen ni lo sigue de a uno: solo concilia
+una vez al día (_conciliar_resumenes_si_toca) para detectar un resumen
+RECHAZADO por SUNAT y reencolar sus boletas — un resumen aceptado no requiere
+ninguna acción, cada boleta ya quedó enviado=1 desde que se firmó.
 
 Se pide `incluir=xml` en el POST para los dos tipos por igual (no solo
 boleta): es la única oportunidad de conseguir el XML de una boleta, porque una
-vez que el resumen diario la consume su propia consulta (GET) empieza a
-devolver 404. Para factura/nota también se homologa el mismo pedido, aunque
-ahí el GET posterior siga funcionando — un solo camino de código en vez de
-dos. El CDR nunca se pide en el POST: para factura/nota se consulta aparte
-cuando hace falta (ver aplicacion/ciclo_pdf.py); una boleta nunca tiene CDR
-propio (es el del resumen que la agrupa).
+vez que el resumen diario la consume su propia consulta (GET) deja de dar
+"generado" y pasa a mostrar el estado del resumen. Para factura/nota también
+se homologa el mismo pedido, aunque ahí el GET posterior siga funcionando —
+un solo camino de código en vez de dos. El CDR nunca se pide en el POST: para
+factura/nota se consulta aparte cuando hace falta (ver
+aplicacion/ciclo_pdf.py); una boleta nunca tiene CDR propio (es el del
+resumen que la agrupa).
 
 Manejo de cada estado de la respuesta (spec de facturador-api, HTTP siempre
 201 salvo problemas de transporte — ver estado/envio_api.py para la
@@ -31,28 +36,38 @@ persistencia):
     cola de "esperando CDR" que se reconsulta por GET en cada ciclo.
   - rechazado → guarda el motivo (codigo_error + descripcion_error + des_obse),
     NO marca enviado, NO se reintenta más de MAX_REINTENTOS_RECHAZO veces.
-  - error → ambiguo por diseño (puede ser de red): NO se reintenta a ciegas
-    en el momento. Backoff creciente antes de volver a intentar el mismo
-    POST — la propia API verifica con SUNAT antes de reenviar (spec §5), así
-    que no hace falta que este daemon haga su propio GET de verificación acá.
+  - anulado → venció el plazo de 7 días sin que SUNAT lo recibiera (spec §4):
+    se trata igual que un rechazo (nunca va a poder reenviarse con el mismo
+    número; hace falta uno nuevo), reutilizando el mismo mecanismo de bloqueo.
+  - error → ambiguo por diseño (puede ser de red): se deja tal cual, sin
+    backoff propio — la API ya reintenta sola (5 intentos cada 10 min, hasta
+    3 días, spec §4) y verifica con SUNAT antes de reenviar, así que ni hace
+    falta un GET de verificación acá ni tiene sentido duplicar ese reintento.
   - HTTP 404 (RUC sin alta) → error crítico, corta el ciclo entero.
   - HTTP 422 (payload inválido) → se trata como un rechazo: hay que corregir
     el dato, no tiene sentido reintentar igual.
-  - HTTP 502 → la API ya verificó que no se envió nada: se reintenta con
-    backoff, sin gastar presupuesto de rechazos.
+  - HTTP 502 → la API ya verificó que no se envió nada: se reintenta en el
+    próximo ciclo, sin gastar presupuesto de rechazos ni backoff propio.
   - Sin respuesta HTTP en absoluto (timeout real, corte de red) → ambiguo de
     verdad: se resuelve con un GET antes de seguir. Si ni el GET lo resuelve,
     queda "en vuelo" para el próximo ciclo (idempotencia ante un corte del
     propio daemon).
+
+Ningún comprobante individual tiene backoff propio ante error/502/timeout: eso
+ahora lo hace la API sola. El único backoff que queda es el del CICLO
+ENTERO (_ESPERA_MAX_CICLO_MIN, ver config.py) — cuando el daemon directamente
+no puede llegar a facturador-api (sin internet en la estación, servicio
+caído), reintentar cada INTERVALO_GENERACION_SEG no tiene sentido y solo
+llena el log; ese backoff se aplana en 2 horas por defecto.
 """
 import logging
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import integraciones
 from config import (
     FACTURADOR_API_URL, NOTIFICADOR_COMPROBANTES,
-    MAX_REINTENTOS_RECHAZO, _MAX_ERRORS_SQL, _MAX_BLOQUEADOS_LOG,
+    MAX_REINTENTOS_RECHAZO, _MAX_ERRORS_SQL, _MAX_BLOQUEADOS_LOG, _ESPERA_MAX_CICLO_MIN,
 )
 from aplicacion.bd_app import conectar_bd, _bd, _escribir_bd
 from aplicacion.lecturas import (
@@ -127,6 +142,12 @@ def _motivo_rechazo(body: dict) -> str:
     return " - ".join(partes) or body.get("des_obse") or "sin detalle"
 
 
+def _motivo_anulado(body: dict) -> str:
+    """Un anulado no tiene codigo_error (nunca llegó a SUNAT): el motivo vive
+    en des_obse (spec §4, vencimiento del plazo de 7 días)."""
+    return f"ANULADO (plazo de 7 días vencido, requiere un número nuevo): {body.get('des_obse') or 'sin detalle'}"
+
+
 def _armar_payload(conn, comp: dict) -> dict:
     receptor = obtener_receptor(conn, comp["factura_id"])
     items = obtener_items(conn, comp["factura_id"])
@@ -173,7 +194,6 @@ def _cerrar_comprobante(conn, ruc: str, tipo: str, numeracion: str, body: dict):
         raise _FallaInfraestructura()
     _escribir_bd(_bd().marcar_enviado, conn, numeracion, True, True)
     envio_api.limpiar_rechazo(numeracion)
-    envio_api.limpiar_espera_infra(numeracion)
     envio_api.olvidar_en_vuelo(numeracion)
     envio_api.quitar_esperando_cdr(numeracion)
     _notificar_comprobante_aceptado(ruc, tipo, numeracion)
@@ -232,6 +252,9 @@ def _resolver_ambiguo(ruc: str, tipo: str, numeracion: str) -> bool:
         if estado == "rechazado":
             _cerrar_rechazado(numeracion, _motivo_rechazo(resp.body))
             return True
+        if estado == "anulado":
+            _cerrar_rechazado(numeracion, _motivo_anulado(resp.body))
+            return True
         # generado (factura/nota, sin enviar aún) / enviado-validando-pendiente
         # / error: sigue en curso, no se toca.
     logger.info("Comprobante %s sigue ambiguo (HTTP %s); se reintenta la consulta.", codigo, resp.status)
@@ -289,6 +312,8 @@ def _resolver_esperando_cdr(ruc: str):
                     conn.close()
         elif estado == "rechazado":
             _cerrar_rechazado(numeracion, _motivo_rechazo(resp.body))
+        elif estado == "anulado":
+            _cerrar_rechazado(numeracion, _motivo_anulado(resp.body))
         # sigue esperando: no se toca, se reconsulta en el próximo ciclo.
 
 
@@ -338,15 +363,20 @@ def _procesar_comprobante(conn, ruc: str, comp: dict):
         if estado == "rechazado":
             _cerrar_rechazado(numeracion, _motivo_rechazo(resp.body))
             return
+        if estado == "anulado":
+            _cerrar_rechazado(numeracion, _motivo_anulado(resp.body))
+            return
         if estado == "error":
-            # Ambiguo por diseño: la propia API verifica con SUNAT antes de
-            # reenviar en el próximo intento (spec §5) — acá solo aplica
-            # backoff, no hace falta un GET propio de verificación.
-            minutos = envio_api.anotar_espera_infra(numeracion)
+            # Ambiguo por diseño: la propia API reintenta sola (5 intentos
+            # cada 10 min, hasta 3 días — spec §4), así que acá no hace falta
+            # backoff propio ni un GET de verificación: se deja tal cual,
+            # sigue en enviado=0 y el daemon la vuelve a mandar en el próximo
+            # ciclo (reenviar el mismo número es seguro, la API consulta a
+            # SUNAT antes de reintentar).
             envio_api.olvidar_en_vuelo(numeracion)
             logger.warning(
-                "Comprobante %s en estado 'error' (%s); se reintenta en %.0f min.",
-                codigo, resp.body.get("des_obse", ""), minutos,
+                "Comprobante %s en estado 'error' (%s); la API lo reintenta sola.",
+                codigo, resp.body.get("des_obse", ""),
             )
             raise _FallaInfraestructura()
         logger.warning("Comprobante %s: estado desconocido %r; se revisa a mano.", codigo, estado)
@@ -368,11 +398,10 @@ def _procesar_comprobante(conn, ruc: str, comp: dict):
         return
 
     if resp.status == 502:
-        minutos = envio_api.anotar_espera_infra(numeracion)
         envio_api.olvidar_en_vuelo(numeracion)
         logger.warning(
-            "facturador-api verificó que %s no se envió (502); se reintenta en %.0f min.",
-            codigo, minutos,
+            "facturador-api verificó que %s no se envió (502); se reintenta en "
+            "el próximo ciclo.", codigo,
         )
         raise _FallaInfraestructura()
 
@@ -383,52 +412,15 @@ def _procesar_comprobante(conn, ruc: str, comp: dict):
     raise _FallaInfraestructura()
 
 
-def _procesar_resumen_diario_si_toca(ruc: str):
+def _conciliar_resumenes_si_toca(ruc: str):
+    """Una vez por día alcanza: la API arma y resuelve el resumen sola, acá
+    solo hace falta enterarse de qué quedó rechazado."""
     global _ultima_fecha_resumen
     hoy = date.today()
-    if _ultima_fecha_resumen != hoy:
-        _ultima_fecha_resumen = hoy
-        _procesar_resumenes_diarios(ruc)
-    _resolver_resumenes_pendientes(ruc)
-
-
-def _procesar_resumenes_diarios(ruc: str):
-    """
-    POST /resumenes-diarios repetidas veces hasta agotar los pendientes
-    (respuesta con "mensaje") o el tope diario de la propia API (409).
-    """
-    intentos = 0
-    while intentos < 25:   # margen sobre el tope de 20 que ya aplica la API
-        intentos += 1
-        resp = cliente.crear_resumen_diario(ruc)
-        if resp.status == 409:
-            logger.warning("Tope diario de resúmenes alcanzado en facturador-api; se sigue mañana.")
-            return
-        # 200 cuenta igual que 201: la API arma el resumen de todas formas (se
-        # vio en producción) — lo que importa es si el cuerpo trae numeracion_rc,
-        # no el código HTTP exacto.
-        if resp.status not in (200, 201) or not resp.body:
-            logger.warning(
-                "No se pudo armar el resumen diario (HTTP %s): %r; se reintenta otro día.",
-                resp.status, resp.body,
-            )
-            return
-        if "mensaje" in resp.body:
-            logger.info("Sin boletas pendientes de resumir: %s", resp.body["mensaje"])
-            return
-        numeracion_rc = resp.body.get("numeracion_rc")
-        if not numeracion_rc:
-            logger.warning(
-                "Respuesta inesperada de /resumenes-diarios (HTTP %s, sin "
-                "numeracion_rc): %r", resp.status, resp.body,
-            )
-            return
-        boletas = resp.body.get("boletas", [])
-        logger.info(
-            "Resumen diario %s armado (%d boleta(s)); se resuelve con consultas "
-            "posteriores.", numeracion_rc, resp.body.get("cantidad_boletas", len(boletas)),
-        )
-        envio_api.agregar_resumen_pendiente(numeracion_rc, boletas)
+    if _ultima_fecha_resumen == hoy:
+        return
+    _ultima_fecha_resumen = hoy
+    _conciliar_resumenes(ruc)
 
 
 def _reencolar_boletas_de_resumen_rechazado(numeracion_rc: str, boletas: list):
@@ -456,28 +448,33 @@ def _reencolar_boletas_de_resumen_rechazado(numeracion_rc: str, boletas: list):
     )
 
 
-def _resolver_resumenes_pendientes(ruc: str):
+def _conciliar_resumenes(ruc: str):
     """
-    Consulta GET .../comprobantes/RC-{numeracion_rc} de cada resumen todavía
-    sin veredicto — esa consulta ya resuelve el ticket de SUNAT del lado del
-    servidor.
+    GET /empresas/{ruc}/resumenes — la API arma y resuelve el resumen diario
+    de boletas por su cuenta (spec §3), así que acá no hace falta dispararlo
+    ni seguirlo de a uno: solo barrer el historial reciente para encontrar
+    algún resumen RECHAZADO por SUNAT y reencolar sus boletas. Uno aceptado no
+    requiere ninguna acción —cada boleta ya quedó enviado=1 al firmarse
+    ("generado" ya es su cierre, ver _cerrar_comprobante)—.
+
+    `desde` cubre algo más que el plazo de 7 días: un resumen puede tardar en
+    resolverse y la lista trae también los ya resueltos, así que barrerla de
+    más es inofensivo — lo que evita reprocesar un rechazo ya reencolado es
+    el set persistido en envio_api.resumen_rechazo_procesado, no la ventana.
     """
-    for numeracion_rc, boletas in envio_api.resumenes_pendientes().items():
-        # Tolera numeracion_rc con o sin el prefijo "RC-" para no consultar "RC-RC-...".
-        codigo = numeracion_rc if numeracion_rc.startswith("RC-") else f"RC-{numeracion_rc}"
-        resp = cliente.consultar_comprobante(ruc, codigo)
-        if resp.status != 200 or not resp.body:
-            logger.info("Resumen %s: todavía sin resolver (HTTP %s).", numeracion_rc, resp.status)
+    desde = (date.today() - timedelta(days=10)).isoformat()
+    resp = cliente.listar_resumenes(ruc, desde)
+    if resp.status != 200 or not resp.body:
+        logger.info("No se pudo listar resúmenes para conciliar (HTTP %s).", resp.status)
+        return
+    for resumen in resp.body.get("resumenes", []):
+        numeracion_rc = resumen.get("numeracion_rc")
+        if not numeracion_rc or resumen.get("estado") != "rechazado":
             continue
-        estado = resp.body.get("estado")
-        if estado in _ESTADOS_ACEPTADOS:
-            logger.info("Resumen %s aceptado por SUNAT (%d boleta(s)).", numeracion_rc, len(boletas))
-            envio_api.quitar_resumen_pendiente(numeracion_rc)
-        elif estado == "rechazado":
-            envio_api.quitar_resumen_pendiente(numeracion_rc)
-            _reencolar_boletas_de_resumen_rechazado(numeracion_rc, boletas)
-        else:
-            logger.info("Resumen %s todavía en curso (%s).", numeracion_rc, estado)
+        if envio_api.resumen_rechazo_procesado(numeracion_rc):
+            continue
+        _reencolar_boletas_de_resumen_rechazado(numeracion_rc, resumen.get("boletas", []))
+        envio_api.marcar_resumen_rechazo_procesado(numeracion_rc)
 
 
 def ciclo_generacion():
@@ -539,7 +536,7 @@ def ciclo_generacion():
             # El ciclo entero no pudo avanzar nada por fallas de infraestructura:
             # backoff creciente para no martillar un servicio que parece caído.
             fallos_ciclo = envio_api.contar_fallo_ciclo()
-            espera_min = min(2 ** (fallos_ciclo - 1), 15)
+            espera_min = min(2 ** (fallos_ciclo - 1), _ESPERA_MAX_CICLO_MIN)
             logger.warning(
                 "%d corrida(s) seguidas sin poder avanzar nada por fallas de "
                 "infraestructura; se pausa %d min antes del próximo intento.",
@@ -547,7 +544,7 @@ def ciclo_generacion():
             )
             time.sleep(espera_min * 60)
 
-        _procesar_resumen_diario_si_toca(ruc)
+        _conciliar_resumenes_si_toca(ruc)
 
     except Exception:
         logger.exception("Error en ciclo_generacion")
