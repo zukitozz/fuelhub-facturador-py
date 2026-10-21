@@ -50,6 +50,9 @@ cg.obtener_items = lambda conn, fid: [{
     "descripcion": "ITEM", "codigo_producto": None, "medida": "NIU",
     "cantidad": 1, "valor": 100.0, "valor_venta": 100.0, "igv_venta": 18.0, "precio": 118.0,
 }]
+# por defecto, sin resúmenes que conciliar: evita que la conciliación diaria
+# (dispara una vez por calendario, no por test) llegue a llamar de verdad.
+cg.cliente.listar_resumenes = lambda ruc, desde: RespuestaAPI(200, {"resumenes": []})
 
 CAP = {"guardado_respuesta": [], "marcado_enviado": [], "guardado_error": []}
 class FakeBD:
@@ -81,7 +84,6 @@ cg.cliente.crear_comprobante = lambda ruc, payload, numeracion="": RespuestaAPI(
     201, {"codigo": "01-F002-000002", "estado": "aceptado", "des_obse": "-",
           "hash": "HASH==", "qr": "20609785269|01|...|HASH=="},
 )
-cg.cliente.crear_resumen_diario = lambda ruc: RespuestaAPI(201, {"mensaje": "No hay boletas pendientes de resumir."})
 cg.ciclo_generacion()
 check(CAP["marcado_enviado"] == ["F002-000002"], f"se marca enviado=1 ({CAP['marcado_enviado']})")
 check(CAP["guardado_respuesta"] and CAP["guardado_respuesta"][0][1] == "HASH==", "se guarda el hash")
@@ -112,6 +114,16 @@ antes = len(CAP["guardado_error"])
 cg.ciclo_generacion()
 check(len(CAP["guardado_error"]) == antes, "una vez bloqueado, no se vuelve a intentar")
 
+# --- caso 3b: anulado (venció el plazo de 7 días) se trata como un rechazo --
+reset()
+cg.obtener_comprobantes_pendientes = lambda conn: [_comp("F002-000003b")]
+cg.cliente.crear_comprobante = lambda ruc, payload, numeracion="": RespuestaAPI(
+    201, {"codigo": "01-F002-000003b", "estado": "anulado", "des_obse": "venció el plazo de 7 días"},
+)
+cg.ciclo_generacion()
+check(not CAP["marcado_enviado"], "un anulado nunca se marca enviado=1")
+check(CAP["guardado_error"] and "ANULADO" in CAP["guardado_error"][0][1], "se guarda el motivo de la anulación")
+
 # --- caso 4: HTTP 404 (RUC sin alta) corta el ciclo entero ------------------
 reset()
 cg.obtener_comprobantes_pendientes = lambda conn: [_comp("F002-000004"), _comp("F002-000005")]
@@ -130,7 +142,7 @@ cg.cliente.crear_comprobante = lambda ruc, payload, numeracion="": RespuestaAPI(
 cg.ciclo_generacion()
 check(not CAP["guardado_error"], "un 502 no se guarda como error de datos")
 check(not envio_api.bloqueado("F002-000006"), "un 502 no bloquea el comprobante")
-check(envio_api.espera_infra_de("F002-000006") > 0, "queda una espera de backoff registrada")
+check("F002-000006" not in envio_api.en_vuelo(), "no queda 'en vuelo': se reintenta solo en el próximo ciclo")
 
 # --- caso 6: respuesta ambigua (timeout) se resuelve con un GET -------------
 reset()
@@ -201,9 +213,9 @@ cg.cliente.crear_comprobante = lambda ruc, payload, numeracion="": RespuestaAPI(
 cg.ciclo_generacion()
 check(not CAP["guardado_error"], "un estado 'error' no se guarda como rechazo de datos")
 check(not envio_api.bloqueado("F002-000010"), "no cuenta contra el presupuesto de rechazos")
-check(envio_api.espera_infra_de("F002-000010") > 0, "queda backoff de infraestructura")
+check("F002-000010" not in envio_api.en_vuelo(), "no queda 'en vuelo': la API lo reintenta sola")
 
-# --- caso 10: resumen rechazado -> sus boletas vuelven a la cola -----------
+# --- caso 10: conciliación detecta un resumen rechazado -> reencola boletas -
 reset()
 marcados_false = []
 def fake_marcar_enviado_false(conn, numeracion, enviado=True, limpiar_error=True):
@@ -218,15 +230,20 @@ cg._bd = lambda: type("FakeBD2", (), {
     "guardar_respuesta": staticmethod(FakeBD.guardar_respuesta),
 })()
 cg.obtener_comprobantes_pendientes = lambda conn: []
-cg.cliente.crear_resumen_diario = lambda ruc: RespuestaAPI(201, {"mensaje": "No hay boletas de días anteriores pendientes de resumir."})
-envio_api.agregar_resumen_pendiente("RC-20261010-001", ["B001-000001", "B001-000002"])
-cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(
-    200, {"codigo": codigo, "estado": "rechazado", "des_obse": "2282 - ya informado"},
-)
-cg._ultima_fecha_resumen = __import__("datetime").date.today()   # ya se intentó armar hoy, solo resolver pendientes
+cg.cliente.listar_resumenes = lambda ruc, desde: RespuestaAPI(200, {"ruc": "20609785269", "total": 1, "resumenes": [
+    {"numeracion_rc": "RC-20261010-001", "codigo": "RC-RC-20261010-001", "estado": "rechazado",
+     "des_obse": "2282 - ya informado", "boletas": ["B001-000001", "B001-000002"]},
+]})
+cg._ultima_fecha_resumen = None   # fuerza a conciliar hoy
 cg.ciclo_generacion()
 check(set(marcados_false) == {"B001-000001", "B001-000002"}, f"las boletas del resumen rechazado vuelven a enviado=0 ({marcados_false})")
-check("RC-20261010-001" not in envio_api.resumenes_pendientes(), "el resumen sale de la cola de pendientes")
+check(envio_api.resumen_rechazo_procesado("RC-20261010-001"), "el resumen rechazado queda marcado como ya procesado")
+
+# aunque /resumenes lo siga listando (trae el historial completo), no se reencola dos veces:
+marcados_false.clear()
+cg._ultima_fecha_resumen = None
+cg.ciclo_generacion()
+check(not marcados_false, "un resumen ya procesado no se reencola de nuevo aunque siga apareciendo")
 cg._bd = lambda: FakeBD()   # se restaura para no afectar corridas futuras de este archivo
 
 # --- caso 11: falla guardar_respuesta -> no marca enviado, cierra por GET --
@@ -258,26 +275,6 @@ cg.ciclo_generacion()
 check(CAP["marcado_enviado"] == ["F002-000012"], "el ciclo siguiente lo cierra por GET")
 check(intentos_post["n"] == 1, "nunca hubo un segundo POST")
 cg._bd = lambda: FakeBD()
-
-# --- caso 12: resumen diario responde HTTP 200 (no 201) pero con numeracion_rc --
-reset()
-cg.obtener_comprobantes_pendientes = lambda conn: []
-llamados_resumen = {"n": 0}
-def fake_resumen_200(ruc):
-    llamados_resumen["n"] += 1
-    if llamados_resumen["n"] == 1:
-        return RespuestaAPI(200, {"numeracion_rc": "RC-20261018-001", "boletas": ["B001-000003"]})
-    return RespuestaAPI(201, {"mensaje": "No hay más boletas pendientes de resumir."})
-cg.cliente.crear_resumen_diario = fake_resumen_200
-codigos_consultados = []
-def fake_get_resumen(ruc, codigo):
-    codigos_consultados.append(codigo)
-    return RespuestaAPI(200, {"estado": "validando"})
-cg.cliente.consultar_comprobante = fake_get_resumen
-cg._ultima_fecha_resumen = None
-cg.ciclo_generacion()
-check("RC-20261018-001" in envio_api.resumenes_pendientes(), "un 200 con numeracion_rc se registra igual que un 201")
-check(codigos_consultados == ["RC-20261018-001"], f"se consulta el RC sin doble prefijo ({codigos_consultados})")
 
 if FALLAS:
     print(str(FALLAS) + ' FALLA(S)')

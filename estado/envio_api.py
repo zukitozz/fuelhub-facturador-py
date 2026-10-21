@@ -20,10 +20,9 @@ Tres cosas separadas que comparten un solo archivo:
 import json
 import logging
 import threading
-import time
 from datetime import datetime
 
-from config import _ENVIO_API_PATH, MAX_REINTENTOS_RECHAZO, _ESPERA_MAX_INFRA_MIN
+from config import _ENVIO_API_PATH, MAX_REINTENTOS_RECHAZO
 from utilidades_files import escribir_archivo
 
 logger = logging.getLogger(__name__)
@@ -113,46 +112,10 @@ def bloqueados() -> dict:
     }
 
 
-# --- backoff de infraestructura (502 / timeout ya resuelto como "no llegó") -
-
-def anotar_espera_infra(numeracion: str) -> float:
-    """
-    Registra una falla de infraestructura (no de datos) y devuelve los minutos
-    de espera antes de reintentar. 1, 2, 4, 8, 15, 15... — arranca cerca del
-    ciclo normal para que un corte de segundos no demore el comprobante, y se
-    aplana en _ESPERA_MAX_INFRA_MIN para no dejarlo esperando de más una vez
-    que el servicio ya volvió.
-    """
-    with _lock:
-        datos = _leer()
-        registro = datos.get("infra", {}).get(numeracion) or {}
-        cortes = int(registro.get("cortes", 0)) + 1
-        minutos = min(2 ** (cortes - 1), _ESPERA_MAX_INFRA_MIN)
-        datos.setdefault("infra", {})[numeracion] = {
-            "cortes": cortes,
-            "esperar_hasta": time.time() + minutos * 60,
-        }
-        _guardar(datos)
-        return minutos
-
-
-def espera_infra_de(numeracion: str) -> float:
-    """Marca de tiempo (epoch) hasta la que este comprobante no se reintenta."""
-    registro = _leer().get("infra", {}).get(numeracion) or {}
-    try:
-        return float(registro.get("esperar_hasta", 0))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def limpiar_espera_infra(numeracion: str):
-    with _lock:
-        datos = _leer()
-        if datos.get("infra", {}).pop(numeracion, None) is not None:
-            _guardar(datos)
-
-
 # --- backoff del ciclo entero: varias corridas seguidas sin poder avanzar ---
+# --- Un comprobante puntual en "error"/502/timeout ya NO tiene backoff -------
+# --- propio: eso lo reintenta la API sola. Esto es para cuando el daemon no -
+# --- puede ni llegar a facturador-api (sin internet, servicio caído). -------
 
 def contar_fallo_ciclo() -> int:
     """Suma una corrida que terminó sin poder procesar nada por fallas de
@@ -176,28 +139,22 @@ def limpiar_fallos_ciclo():
             _guardar(datos)
 
 
-# --- resúmenes diarios en curso: se resuelven con GET en cada ciclo, no solo -
-# --- una vez al día, porque SUNAT puede tardar horas en resolver el ticket. --
-# --- Se guarda también la lista de boletas de cada uno: si el resumen se ----
-# --- rechaza, esas boletas vuelven a la cola para regenerarse (ver spec §6). -
+# --- conciliación de resúmenes diarios: ahora los arma y resuelve la propia -
+# --- API sola (spec §3); acá solo se recuerda qué resumen RECHAZADO ya se ---
+# --- reencoló, para no repetirlo cada vez que /resumenes lo vuelva a listar -
+# --- (trae el historial completo, no solo lo pendiente). --------------------
 
-def agregar_resumen_pendiente(numeracion_rc: str, boletas: list):
+def resumen_rechazo_procesado(numeracion_rc: str) -> bool:
+    return numeracion_rc in _leer().get("resumenes_rechazo_procesados", [])
+
+
+def marcar_resumen_rechazo_procesado(numeracion_rc: str):
     with _lock:
         datos = _leer()
-        datos.setdefault("resumenes_pendientes", {})[numeracion_rc] = list(boletas)
+        procesados = set(datos.get("resumenes_rechazo_procesados", []))
+        procesados.add(numeracion_rc)
+        datos["resumenes_rechazo_procesados"] = sorted(procesados)
         _guardar(datos)
-
-
-def resumenes_pendientes() -> dict:
-    """{numeracion_rc: [boletas]} de los resúmenes todavía sin veredicto."""
-    return dict(_leer().get("resumenes_pendientes", {}))
-
-
-def quitar_resumen_pendiente(numeracion_rc: str):
-    with _lock:
-        datos = _leer()
-        if datos.get("resumenes_pendientes", {}).pop(numeracion_rc, None) is not None:
-            _guardar(datos)
 
 
 # --- comprobantes aceptados por SUNAT pero sin CDR todavía (estado enviado/ -

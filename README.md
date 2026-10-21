@@ -97,35 +97,47 @@ ahí; se consulta aparte (ver `ciclo_pdf.py`). Ver
 | `generado` (factura/nota) | No se toca nada: sigue `enviado=0` y el próximo ciclo reintenta el `POST` solo |
 | `enviado` / `validando` / `pendiente` | SUNAT ya la tiene, falta el CDR: guarda el XML si vino, no marca enviado, se reconsulta por `GET` en cada ciclo hasta tener veredicto |
 | `rechazado` / HTTP 422 | Guarda el motivo (`codigo_error`+`descripcion_error`) en `errors`; **no** reintenta solo más de `MAX_REINTENTOS_RECHAZO` veces |
-| `error` | Ambiguo por diseño: backoff creciente antes de reintentar el mismo `POST` — la propia API verifica con SUNAT antes de reenviar, no hace falta un `GET` propio |
+| `anulado` | Venció el plazo de 7 días sin que SUNAT lo recibiera: se trata igual que un rechazo (hace falta un número nuevo, nunca va a poder reenviarse con el mismo) |
+| `error` | Ambiguo por diseño: se deja tal cual, SIN backoff propio — la API ya reintenta sola (5 intentos cada 10 min, hasta 3 días) y verifica con SUNAT antes de reenviar |
 | HTTP 404 (RUC sin alta) | Error crítico: corta el ciclo entero |
-| HTTP 502 | La API ya verificó que no se envió nada: reintenta con backoff, sin gastar presupuesto de rechazos |
+| HTTP 502 | La API ya verificó que no se envió nada: se reintenta en el próximo ciclo, sin backoff propio ni gastar presupuesto de rechazos |
 | Sin respuesta HTTP (timeout real) | Ambiguo de verdad: se resuelve con un `GET` antes de seguir — nunca se reenvía a ciegas |
 
 **Tope de reenvíos.** Un reenvío manda exactamente los mismos datos, así que si
 facturador-api rechazó por un dato mal armado el resultado no cambia. De ahí el
 tope (`MAX_REINTENTOS_RECHAZO`, 3 por defecto); al agotarlo el comprobante queda
-bloqueado hasta que se corrija el dato. El conteo vive en `envio_api.json` (no se
-versiona), junto con la idempotencia ante un corte a mitad de un envío, el
-backoff de fallas de infraestructura, los comprobantes esperando CDR y los
-resúmenes diarios sin veredicto — ver `estado/envio_api.py`.
+bloqueado hasta que se corrija el dato. Un `error`/`502`/timeout, en cambio, **no
+tiene backoff propio**: eso ahora lo hace la API sola (ver más abajo), así que el
+daemon simplemente lo vuelve a intentar en el próximo ciclo sin contar nada. El
+único backoff que queda de este lado es el del **ciclo entero**
+(`ESPERA_MAX_CICLO_MIN`, 2 horas por defecto): si el daemon directamente no puede
+llegar a facturador-api —sin internet en la estación, el servicio caído de
+verdad—, reintentar cada `INTERVALO_GENERACION_SEG` no tiene sentido y solo llena
+el log, así que la pausa entre corridas crece hasta ese techo. El conteo de
+rechazos y de fallos de ciclo vive en `envio_api.json` (no se versiona), junto
+con la idempotencia ante un corte a mitad de un envío y los comprobantes
+esperando CDR — ver `estado/envio_api.py`.
 
 ## Resumen diario de boletas
 
 Ninguna boleta se envía individualmente — facturador-api la firma pero la agrupa en
-un resumen diario (`RC`) del lado del servidor. Una vez al día, el daemon:
+un resumen diario (`RC`) del lado del servidor, sola: todos los días a las 00:10
+hora de Lima arma y envía un resumen por cada fecha pendiente, resuelve el ticket
+de SUNAT y deja el CDR, sin que el daemon tenga que dispararlo ni seguirlo de a
+uno (antes el propio daemon llamaba `POST /resumenes-diarios`; ya no).
 
-1. Llama `POST /resumenes-diarios` repetidas veces hasta que facturador-api dice que
-   no hay más boletas de días anteriores pendientes de agrupar, o hasta su propio
-   tope diario. La respuesta trae la lista de boletas que agrupó.
-2. Por cada resumen armado, consulta su estado con `GET` en cada ciclo hasta tener
-   veredicto — esa consulta resuelve el ticket de SUNAT del lado del servidor, el
-   daemon no habla SOAP con nadie.
-3. **Aceptado**: nada más que hacer — cada boleta ya quedó `enviado=1` desde que
-   se firmó individualmente (`generado`), con su propio XML ya guardado.
-4. **Rechazado**: las boletas de la lista vuelven a `enviado=0` con el motivo
-   guardado, para que el próximo ciclo las regenere (nuevo `POST` individual,
-   nuevo XML) y entren a un resumen nuevo.
+Lo único que hace el daemon, una vez al día, es **conciliar**: `GET
+/empresas/{ruc}/resumenes` trae los resúmenes recientes con sus boletas y su
+`estado`.
+
+- **Aceptado**: nada que hacer — cada boleta ya quedó `enviado=1` desde que se
+  firmó individualmente (`generado`), con su propio XML ya guardado.
+- **Rechazado**: las boletas de ese resumen vuelven a `enviado=0` con el motivo
+  guardado, para que el próximo ciclo las regenere (nuevo `POST` individual,
+  nuevo XML) y entren a un resumen nuevo. Como `/resumenes` trae el historial
+  completo (no solo lo pendiente), el daemon recuerda en `envio_api.json` qué
+  resumen rechazado ya reencoló, para no repetirlo cada vez que lo vuelva a ver
+  en la lista.
 
 ## Requisitos
 
@@ -205,7 +217,7 @@ FACTURADOR_API_KEY=                   # opcional, hoy facturador-api no exige au
 
 INTERVALO_GENERACION_SEG=60
 MAX_REINTENTOS_RECHAZO=3              # reenvíos de un comprobante rechazado, antes de bloquearlo
-ESPERA_MAX_INFRA_MIN=15               # techo del backoff ante un 502/timeout de facturador-api
+ESPERA_MAX_CICLO_MIN=120              # techo del backoff cuando el daemon no llega a facturador-api
 MOTIVO_NOTA_POR_DEFECTO=              # ver "Tipos de comprobante" más arriba
 
 DESFASE_BD_HORAS=auto                 # "auto" lo mide en cada ciclo
@@ -260,10 +272,12 @@ enviado=1   según la tabla de arriba
 (hash, QR,
  url guardados)
 
-Boletas: además, una vez al día,
-POST /empresas/{ruc}/resumenes-diarios
-hasta agotar pendientes, y GET periódico
-de cada resumen hasta tener veredicto.
+Boletas: la API arma y declara el resumen
+diario sola (00:10 hora Lima). El daemon
+solo concilia una vez al día con
+GET /empresas/{ruc}/resumenes para
+reencolar las boletas de un resumen
+rechazado.
 ```
 
 ## Integraciones salientes

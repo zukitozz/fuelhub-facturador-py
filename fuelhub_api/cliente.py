@@ -114,9 +114,17 @@ def consultar_comprobante(ruc: str, codigo: str) -> RespuestaAPI:
     return _llamar("GET", ruta, None, codigo)
 
 
-def crear_resumen_diario(ruc: str) -> RespuestaAPI:
-    """POST /empresas/{ruc}/resumenes-diarios — agrupa y envía las boletas de
-    días anteriores que quedaron firmadas y a la espera. Se llama repetidas
-    veces hasta agotar los pendientes (respuesta con "mensaje") o hasta el tope
-    diario de la API (409)."""
-    return _llamar("POST", f"empresas/{urllib.parse.quote(ruc)}/resumenes-diarios", None, "RC")
+def listar_resumenes(ruc: str, desde: str, limite: int = 100) -> RespuestaAPI:
+    """
+    GET /empresas/{ruc}/resumenes?desde=AAAA-MM-DD&limite=N — resúmenes de
+    boletas que la API armó y envió por su cuenta (una boleta nunca se manda
+    sola; queda "generado" hasta que un resumen diario la declara — ver spec
+    §3). Ya no hay que disparar ese resumen desde acá (POST
+    /resumenes-diarios quedó deprecado del lado del daemon): esto es solo
+    para conciliar qué quedó rechazado y reencolar esas boletas.
+    """
+    ruta = (
+        f"empresas/{urllib.parse.quote(ruc)}/resumenes"
+        f"?desde={urllib.parse.quote(desde)}&limite={limite}"
+    )
+    return _llamar("GET", ruta, None, "resumenes")

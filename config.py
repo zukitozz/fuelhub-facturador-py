@@ -61,12 +61,14 @@ NOTIFICADOR_COMPROBANTES = os.getenv("NOTIFICADOR_COMPROBANTES", "noop").strip()
 # quien ya está acostumbrado a verlo en el log.
 MAX_REINTENTOS_RECHAZO = int(os.getenv("MAX_REINTENTOS_RECHAZO", "3"))
 
-# Techo del backoff con el que se reintenta un comprobante trabado por una falla
-# de infraestructura (HTTP 502 de facturador-api, timeout, cualquier otro 5xx) —
-# no gasta presupuesto de reintentos de MAX_REINTENTOS_RECHAZO, porque no es un
-# problema del dato. Se aplana en 15 minutos para que el comprobante salga
-# pronto cuando el servicio vuelva, sin quedar esperando media hora de más.
-_ESPERA_MAX_INFRA_MIN = int(os.getenv("ESPERA_MAX_INFRA_MIN", "15"))
+# Techo del backoff del CICLO ENTERO cuando ninguna llamada a facturador-api
+# puede completarse (sin internet en la estación, o el servicio caído de
+# verdad) — un comprobante puntual en "error"/502/timeout ya no se reintenta
+# con backoff propio: eso ahora lo hace la API sola (5 intentos cada 10 min,
+# hasta 3 días, ver docs/especificacion-consumo-api.md §4). Esto es distinto:
+# si el daemon no puede ni llegar a facturador-api, reintentar cada 60s no
+# tiene sentido y solo llena el log — se aplana en 2 horas.
+_ESPERA_MAX_CICLO_MIN = int(os.getenv("ESPERA_MAX_CICLO_MIN", "120"))
 
 # Motivo (catalogo 09/10) que se le pone a una nota cuya aplicacion no lo guarda.
 # Vacio por defecto: sin esto, el daemon NO inventa un motivo y la nota queda sin
