@@ -269,10 +269,15 @@ def fake_resumen_200(ruc):
         return RespuestaAPI(200, {"numeracion_rc": "RC-20261018-001", "boletas": ["B001-000003"]})
     return RespuestaAPI(201, {"mensaje": "No hay más boletas pendientes de resumir."})
 cg.cliente.crear_resumen_diario = fake_resumen_200
-cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(200, {"estado": "validando"})
+codigos_consultados = []
+def fake_get_resumen(ruc, codigo):
+    codigos_consultados.append(codigo)
+    return RespuestaAPI(200, {"estado": "validando"})
+cg.cliente.consultar_comprobante = fake_get_resumen
 cg._ultima_fecha_resumen = None
 cg.ciclo_generacion()
 check("RC-20261018-001" in envio_api.resumenes_pendientes(), "un 200 con numeracion_rc se registra igual que un 201")
+check(codigos_consultados == ["RC-20261018-001"], f"se consulta el RC sin doble prefijo ({codigos_consultados})")
 
 if FALLAS:
     print(str(FALLAS) + ' FALLA(S)')

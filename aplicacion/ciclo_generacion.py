@@ -463,7 +463,8 @@ def _resolver_resumenes_pendientes(ruc: str):
     servidor.
     """
     for numeracion_rc, boletas in envio_api.resumenes_pendientes().items():
-        codigo = f"RC-{numeracion_rc}"
+        # Tolera numeracion_rc con o sin el prefijo "RC-" para no consultar "RC-RC-...".
+        codigo = numeracion_rc if numeracion_rc.startswith("RC-") else f"RC-{numeracion_rc}"
         resp = cliente.consultar_comprobante(ruc, codigo)
         if resp.status != 200 or not resp.body:
             logger.info("Resumen %s: todavía sin resolver (HTTP %s).", numeracion_rc, resp.status)
