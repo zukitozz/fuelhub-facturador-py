@@ -22,6 +22,14 @@ factura/nota se consulta aparte cuando hace falta (ver
 aplicacion/ciclo_pdf.py); una boleta nunca tiene CDR propio (es el del
 resumen que la agrupa).
 
+Una nota que corrige una BOLETA no se manda hasta que esa boleta esté
+efectivamente ACEPTADA por SUNAT (_referencia_boleta_lista): acá queda
+enviado=1 apenas se firma ("generado"), pero SUNAT recién la conoce cuando su
+resumen diario la declara y es aceptado, que puede tardar horas — mandar la
+nota antes referenciaría un documento que SUNAT todavía no tiene. Una nota
+sobre una FACTURA no tiene este problema (se cierra en la misma llamada del
+POST), así que el chequeo no aplica.
+
 Manejo de cada estado de la respuesta (spec de facturador-api, HTTP siempre
 201 salvo problemas de transporte — ver estado/envio_api.py para la
 persistencia):
@@ -87,6 +95,7 @@ _notificador_comprobantes = integraciones.elegir(NOTIFICADOR_COMPROBANTES)
 
 _ESTADOS_ACEPTADOS = ("aceptado", "aceptado_con_observaciones")
 _ESTADOS_ESPERANDO_CDR = ("enviado", "validando", "pendiente")
+_TIPO_BOLETA = "03"
 
 # Cuántas fallas de infraestructura seguidas dentro de UN ciclo alcanzan para
 # cortarlo y no seguir martillando un servicio que parece caído.
@@ -240,7 +249,7 @@ def _resolver_ambiguo(ruc: str, tipo: str, numeracion: str) -> bool:
         return True
     if resp.status == 200 and resp.body:
         estado = resp.body.get("estado")
-        if estado in _ESTADOS_ACEPTADOS or (tipo == "03" and estado == "generado"):
+        if estado in _ESTADOS_ACEPTADOS or (tipo == _TIPO_BOLETA and estado == "generado"):
             conn = None
             try:
                 conn = conectar_bd()
@@ -317,6 +326,49 @@ def _resolver_esperando_cdr(ruc: str):
         # sigue esperando: no se toca, se reconsulta en el próximo ciclo.
 
 
+def _referencia_boleta_lista(ruc: str, comp: dict) -> bool:
+    """
+    True si esta nota NO corrige una boleta, o si la corrige y esa boleta ya
+    quedó aceptada por SUNAT. Una boleta queda enviado=1 apenas se firma
+    ("generado" ya es su cierre del lado de este daemon — ver
+    _cerrar_comprobante), pero SUNAT recién la conoce cuando su resumen
+    diario la declara y es aceptado (spec §3), que puede tardar horas. Mandar
+    la nota antes de eso referencia un documento que SUNAT todavía no tiene.
+    """
+    referencia = comp.get("referencia")
+    if not referencia or referencia.get("tipo_documento_afectado") != _TIPO_BOLETA:
+        return True
+    numeracion_boleta = referencia.get("numeracion_documento_afectado")
+    resp = cliente.consultar_comprobante(ruc, f"{_TIPO_BOLETA}-{numeracion_boleta}")
+    if resp.status != 200 or not resp.body:
+        return False
+    return resp.body.get("estado") in _ESTADOS_ACEPTADOS
+
+
+def _avisar_nota_esperando_boleta(conn, comp: dict):
+    """
+    Dejar la nota en silencio (enviado=0, sin nada en `errors`) es indistinguible
+    de un comprobante recién creado que todavía no se intentó — el sistema de
+    origen no tiene cómo avisarle al operador que es normal, y alguien podría
+    terminar generando otra nota pensando que la primera falló. Se reutiliza la
+    misma columna `errors` que un rechazo real, con un prefijo que la distingue
+    de un error de verdad.
+    """
+    numeracion_boleta = comp["referencia"]["numeracion_documento_afectado"]
+    detalle = (
+        f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ESPERANDO (no es un error): la "
+        f"boleta {numeracion_boleta} todavía no fue aceptada por SUNAT (resumen "
+        f"diario pendiente); esta nota se envía sola apenas se acepte, no hace "
+        f"falta generar otra."
+    )[:_MAX_ERRORS_SQL]
+    _escribir_bd(_bd().guardar_error, conn, comp["numeracion_comprobante"], detalle)
+    logger.info(
+        "Nota %s espera a que la boleta %s quede aceptada por SUNAT (resumen "
+        "diario todavía sin veredicto); se reintenta en el próximo ciclo.",
+        comp["numeracion_comprobante"], numeracion_boleta,
+    )
+
+
 def _procesar_comprobante(conn, ruc: str, comp: dict):
     tipo = comp["tipo_comprobante"]
     numeracion = comp["numeracion_comprobante"]
@@ -328,7 +380,7 @@ def _procesar_comprobante(conn, ruc: str, comp: dict):
 
     if resp.status == 201 and resp.body:
         estado = resp.body.get("estado")
-        if estado in _ESTADOS_ACEPTADOS or (tipo == "03" and estado == "generado"):
+        if estado in _ESTADOS_ACEPTADOS or (tipo == _TIPO_BOLETA and estado == "generado"):
             _cerrar_comprobante(conn, ruc, tipo, numeracion, resp.body)
             return
         if estado in _ESTADOS_ESPERANDO_CDR:
@@ -499,6 +551,9 @@ def ciclo_generacion():
         for comp in pendientes:
             numeracion = comp["numeracion_comprobante"]
             if numeracion in bloqueados_ahora:
+                continue
+            if not _referencia_boleta_lista(ruc, comp):
+                _avisar_nota_esperando_boleta(conn, comp)
                 continue
             try:
                 _procesar_comprobante(conn, ruc, comp)

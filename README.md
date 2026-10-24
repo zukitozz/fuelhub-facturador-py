@@ -47,6 +47,15 @@ cuando alguien complete el dato. El motivo no se deduce ni se rellena por defect
 —salvo que se configure `MOTIVO_NOTA_POR_DEFECTO`, ver más abajo— porque una nota
 con el motivo equivocado es una declaración incorrecta ante SUNAT.
 
+**Nota sobre una boleta.** No se manda hasta que esa boleta esté efectivamente
+aceptada por SUNAT (`_referencia_boleta_lista` en `ciclo_generacion.py`): acá la
+boleta queda `enviado=1` apenas se firma, pero SUNAT recién la conoce cuando su
+resumen diario la declara y es aceptado, que puede tardar horas — mandar la nota
+antes referenciaría un documento que SUNAT todavía no tiene. Se consulta con un
+`GET` en cada ciclo hasta que la boleta quede `aceptado`; mientras tanto, la nota
+queda esperando sin contar como rechazo. Una nota sobre una factura no tiene este
+problema, se cierra en la misma llamada del `POST`.
+
 ## Validaciones previas
 
 Antes de mandar cualquier comprobante a facturador-api, pasa por
