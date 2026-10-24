@@ -276,6 +276,38 @@ check(CAP["marcado_enviado"] == ["F002-000012"], "el ciclo siguiente lo cierra p
 check(intentos_post["n"] == 1, "nunca hubo un segundo POST")
 cg._bd = lambda: FakeBD()
 
+# --- caso 12: nota sobre boleta espera a que esa boleta quede aceptada -----
+reset()
+def _nota_sobre_boleta(numeracion="N001-000001", numeracion_boleta="B001-000099"):
+    c = _comp(numeracion, tipo="07")
+    c["referencia"] = {
+        "tipo_nota": "01", "tipo_documento_afectado": "03",
+        "numeracion_documento_afectado": numeracion_boleta,
+        "motivo_documento_afectado": "ANULACION DE LA OPERACION",
+    }
+    return c
+cg.obtener_comprobantes_pendientes = lambda conn: [_nota_sobre_boleta()]
+llamadas_post = {"n": 0}
+def fake_post_nota(ruc, payload, numeracion=""):
+    llamadas_post["n"] += 1
+    return RespuestaAPI(201, {"codigo": "07-N001-000001", "estado": "aceptado",
+                              "des_obse": "-", "hash": "HN==", "qr": "qrN"})
+cg.cliente.crear_comprobante = fake_post_nota
+cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(200, {"codigo": codigo, "estado": "generado"})
+cg.ciclo_generacion()
+check(llamadas_post["n"] == 0, "no manda la nota mientras la boleta sigue 'generado' (resumen sin veredicto)")
+aviso = CAP["guardado_error"][0] if CAP["guardado_error"] else (None, "")
+check(
+    aviso[0] == "N001-000001" and "ESPERANDO" in aviso[1] and "B001-000099" in aviso[1],
+    f"deja un aviso (no un error) en la BD para que la UI no lo confunda con un rechazo ({CAP['guardado_error']})",
+)
+
+# una vez que la boleta queda aceptada (su resumen ya fue aceptado por SUNAT), se manda:
+cg.cliente.consultar_comprobante = lambda ruc, codigo: RespuestaAPI(200, {"codigo": codigo, "estado": "aceptado"})
+cg.ciclo_generacion()
+check(llamadas_post["n"] == 1, "una vez que la boleta está aceptada, la nota se manda normal")
+check(CAP["marcado_enviado"] == ["N001-000001"], "la nota queda cerrada")
+
 if FALLAS:
     print(str(FALLAS) + ' FALLA(S)')
     sys.exit(1)
