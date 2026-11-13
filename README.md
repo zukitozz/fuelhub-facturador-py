@@ -76,19 +76,21 @@ servicios de estética que es lo que se factura acá, pero un ítem exonerado o 
 cortesía haría que SUNAT rechace. Resolverlo exige una columna de tipo de afectación
 en `FacturaItem`, que la aplicación no tiene.
 
-## Fecha de emisión y zona horaria
+## Fecha de emisión
 
-La aplicación guarda sus fechas con el reloj de su servidor de base de datos, que
-suele correr en **UTC**; SUNAT espera la hora local del emisor. Sin corregirlo, toda
-venta entre las 19:00 y la medianoche (Perú es UTC−5) queda con la fecha del día
-siguiente: a SUNAT se le declararía una fecha que todavía no llegó.
+`fecha_emision` se manda tal cual está en la BD —`dominio/fechas.py:formatear_fecha_hora`—,
+**sin aplicarle ninguna corrección de huso horario**: es la fecha de negocio que
+declaró quien emitió, no un instante que haya que convertir. Esto incluye
+facturas retroactivas (fecha de negocio anterior a hoy), que son comunes en
+esta aplicación.
 
-Por eso el daemon **mide** el desfase en vez de asumirlo: al inicio de cada ciclo
-compara el reloj de la BD con la hora local y aplica esa corrección
-(`utilidades_timer.py`: `detectar_desfase_bd()` → `fecha_local()`). Si cambian la
-zona horaria del servidor, se ajusta solo en el ciclo siguiente; si la medición
-falla, conserva la última corrección conocida en vez de arriesgar una fecha
-equivocada. Se puede forzar con `DESFASE_BD_HORAS`.
+Hubo una versión anterior (`utilidades_timer.py`, ya eliminado) que medía el
+desfase del reloj de la BD contra UTC y se lo restaba a esta fecha, asumiendo
+que todo lo guardado ahí era un instante real en UTC. Eso rompía dos casos: una
+columna de solo fecha (sin hora) se leía como medianoche y la resta la corría
+un día para atrás, y una factura retroactiva terminaba con la fecha de hoy
+corrida en vez de la fecha de negocio real. Se sacó por completo — ver el
+hallazgo que lo motivó en el historial de `aplicacion/ciclo_generacion.py`.
 
 ## Manejo de la respuesta de facturador-api
 
@@ -229,7 +231,6 @@ MAX_REINTENTOS_RECHAZO=3              # reenvíos de un comprobante rechazado, a
 ESPERA_MAX_CICLO_MIN=120              # techo del backoff cuando el daemon no llega a facturador-api
 MOTIVO_NOTA_POR_DEFECTO=              # ver "Tipos de comprobante" más arriba
 
-DESFASE_BD_HORAS=auto                 # "auto" lo mide en cada ciclo
 LOG_MAX_MB=5                          # rotación de facturador.log
 LOG_ARCHIVOS=5
 NOTIFICADOR_COMPROBANTES=noop         # ver integraciones/README.md; "noop" no hace nada

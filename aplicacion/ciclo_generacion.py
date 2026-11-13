@@ -81,7 +81,7 @@ from aplicacion.bd_app import conectar_bd, _bd, _escribir_bd
 from aplicacion.lecturas import (
     obtener_emisor, obtener_receptor, obtener_items, obtener_comprobantes_pendientes,
 )
-from utilidades_timer import fecha_local
+from dominio.fechas import formatear_fecha_hora
 from fuelhub_api import cliente
 from estado import envio_api
 
@@ -158,12 +158,20 @@ def _motivo_anulado(body: dict) -> str:
 
 
 def _armar_payload(conn, comp: dict) -> dict:
+    """
+    NO se le aplica ninguna corrección de zona horaria a fecha_emision: es la
+    fecha de negocio tal como la declaró quien emitió (incluidas las facturas
+    retroactivas, con fecha anterior a hoy), no un instante que haya que
+    convertir. Restarle horas asumiendo que viene en UTC corría la fecha un
+    día para atrás cuando la columna de origen es solo fecha (sin hora, medianoche
+    naive) — ver historial de este archivo para el caso real que lo mostró.
+    """
     receptor = obtener_receptor(conn, comp["factura_id"])
     items = obtener_items(conn, comp["factura_id"])
     payload = {
         "numeracion_comprobante": comp["numeracion_comprobante"],
         "tipo_comprobante": comp["tipo_comprobante"],
-        "fecha_emision": fecha_local(comp["fecha_emision"]).isoformat(),
+        "fecha_emision": formatear_fecha_hora(comp["fecha_emision"]).isoformat(),
         "total": comp["total"],
         "gravadas": comp["gravadas"],
         "igv": comp["igv"],
