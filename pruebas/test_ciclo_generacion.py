@@ -308,6 +308,27 @@ cg.ciclo_generacion()
 check(llamadas_post["n"] == 1, "una vez que la boleta está aceptada, la nota se manda normal")
 check(CAP["marcado_enviado"] == ["N001-000001"], "la nota queda cerrada")
 
+# --- caso 13: fecha_emision se manda tal cual, sin corrimiento de huso horario --
+reset()
+import datetime as _dt
+payloads_enviados = []
+def fake_post_capta_payload(ruc, payload, numeracion=""):
+    payloads_enviados.append(payload)
+    return RespuestaAPI(201, {"codigo": "01-F002-000013", "estado": "aceptado",
+                              "des_obse": "-", "hash": "H13==", "qr": "qr13"})
+cg.cliente.crear_comprobante = fake_post_capta_payload
+# una columna de solo fecha (sin hora, como Comprobantes.fecha_emision en SQL
+# Server) llega como date, no datetime — este fue el caso real que corría la
+# fecha un día para atrás con la corrección de huso horario que ya no existe.
+comp_fecha_pura = _comp("F002-000013")
+comp_fecha_pura["fecha_emision"] = _dt.date(2026, 11, 9)
+cg.obtener_comprobantes_pendientes = lambda conn: [comp_fecha_pura]
+cg.ciclo_generacion()
+check(
+    payloads_enviados and payloads_enviados[0]["fecha_emision"] == "2026-11-09T00:00:00",
+    f"una fecha sin hora no se corre al día anterior ({payloads_enviados[0]['fecha_emision'] if payloads_enviados else 'no se mandó nada'})",
+)
+
 if FALLAS:
     print(str(FALLAS) + ' FALLA(S)')
     sys.exit(1)
