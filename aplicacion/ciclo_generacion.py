@@ -51,6 +51,12 @@ persistencia):
     backoff propio — la API ya reintenta sola (5 intentos cada 10 min, hasta
     3 días, spec §4) y verifica con SUNAT antes de reenviar, así que ni hace
     falta un GET de verificación acá ni tiene sentido duplicar ese reintento.
+    NO cuenta para el backoff de ciclo entero (ver más abajo): facturador-api
+    sí respondió, así que no es una falla de infraestructura del daemon —
+    puede ser un veredicto permanente para ESE comprobante puntual (se vio en
+    producción: una boleta que la API ya no podía procesar ni por POST ni
+    por el resumen, "más de 5 días"), y contarlo como tal dejaba a la
+    estación entera sin mandar nada durante horas por un solo trabado.
   - HTTP 404 (RUC sin alta) → error crítico, corta el ciclo entero.
   - HTTP 422 (payload inválido) → se trata como un rechazo: hay que corregir
     el dato, no tiene sentido reintentar igual.
@@ -65,8 +71,10 @@ Ningún comprobante individual tiene backoff propio ante error/502/timeout: eso
 ahora lo hace la API sola. El único backoff que queda es el del CICLO
 ENTERO (_ESPERA_MAX_CICLO_MIN, ver config.py) — cuando el daemon directamente
 no puede llegar a facturador-api (sin internet en la estación, servicio
-caído), reintentar cada INTERVALO_GENERACION_SEG no tiene sentido y solo
-llena el log; ese backoff se aplana en 2 horas por defecto.
+caído: 502 o sin respuesta HTTP), reintentar cada INTERVALO_GENERACION_SEG no
+tiene sentido y solo llena el log; ese backoff se aplana en 2 horas por
+defecto. Un "error" NO alimenta este backoff — la API sí respondió, el
+problema (si lo hay) es de ESE comprobante, no de llegar al servicio.
 """
 import logging
 import time
@@ -433,12 +441,23 @@ def _procesar_comprobante(conn, ruc: str, comp: dict):
             # sigue en enviado=0 y el daemon la vuelve a mandar en el próximo
             # ciclo (reenviar el mismo número es seguro, la API consulta a
             # SUNAT antes de reintentar).
+            #
+            # NO se levanta _FallaInfraestructura acá: facturador-api SÍ
+            # respondió (HTTP 201, con cuerpo) — no es que el daemon no haya
+            # podido llegar al servicio, es un veredicto normal para este
+            # comprobante puntual. Contarlo como falla de infraestructura
+            # hacía que un solo comprobante trabado (se vio en producción:
+            # una boleta de más de 5 días que la propia API ya no puede
+            # procesar ni por POST ni por el resumen) disparara el backoff
+            # de CICLO ENTERO y dejara a la estación entera sin mandar nada
+            # durante horas, aunque el resto de los comprobantes sí
+            # funcionaran.
             envio_api.olvidar_en_vuelo(numeracion)
             logger.warning(
                 "Comprobante %s en estado 'error' (%s); la API lo reintenta sola.",
                 codigo, resp.body.get("des_obse", ""),
             )
-            raise _FallaInfraestructura()
+            return
         logger.warning("Comprobante %s: estado desconocido %r; se revisa a mano.", codigo, estado)
         envio_api.olvidar_en_vuelo(numeracion)
         return

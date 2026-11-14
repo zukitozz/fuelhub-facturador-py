@@ -109,7 +109,7 @@ ahí; se consulta aparte (ver `ciclo_pdf.py`). Ver
 | `enviado` / `validando` / `pendiente` | SUNAT ya la tiene, falta el CDR: guarda el XML si vino, no marca enviado, se reconsulta por `GET` en cada ciclo hasta tener veredicto |
 | `rechazado` / HTTP 422 | Guarda el motivo (`codigo_error`+`descripcion_error`) en `errors`; **no** reintenta solo más de `MAX_REINTENTOS_RECHAZO` veces |
 | `anulado` | Venció el plazo de 7 días sin que SUNAT lo recibiera: se trata igual que un rechazo (hace falta un número nuevo, nunca va a poder reenviarse con el mismo) |
-| `error` | Ambiguo por diseño: se deja tal cual, SIN backoff propio — la API ya reintenta sola (5 intentos cada 10 min, hasta 3 días) y verifica con SUNAT antes de reenviar |
+| `error` | Ambiguo por diseño: se deja tal cual, SIN backoff propio — la API ya reintenta sola (5 intentos cada 10 min, hasta 3 días) y verifica con SUNAT antes de reenviar. Tampoco cuenta para el backoff de ciclo entero: la API sí respondió, no es una falla de infraestructura del daemon |
 | HTTP 404 (RUC sin alta) | Error crítico: corta el ciclo entero |
 | HTTP 502 | La API ya verificó que no se envió nada: se reintenta en el próximo ciclo, sin backoff propio ni gastar presupuesto de rechazos |
 | Sin respuesta HTTP (timeout real) | Ambiguo de verdad: se resuelve con un `GET` antes de seguir — nunca se reenvía a ciegas |
@@ -149,6 +149,41 @@ Lo único que hace el daemon, una vez al día, es **conciliar**: `GET
   completo (no solo lo pendiente), el daemon recuerda en `envio_api.json` qué
   resumen rechazado ya reencoló, para no repetirlo cada vez que lo vuelva a ver
   en la lista.
+
+## Subida del PDF a FuelHub core
+
+`Comprobantes.pdf_bytes` es un **buzón temporal**, no un archivo permanente: la
+base de cada estación tiene un tope (SQL Express, 10 GB), así que la aplicación
+de origen lo llena y este daemon (`ciclo_pdf.py`) lo sube a S3 y lo vacía.
+
+| `pdf_bytes` | `pdf_enviado` | Significado |
+|---|---|---|
+| `NULL` | `0` | pendiente de generar, del lado de la aplicación de origen |
+| lleno | `0` | listo para subir |
+| `NULL` | `1` | subido y vaciado |
+
+- **Selección**: `enviado=1 AND pdf_enviado=0 AND pdf_bytes IS NOT NULL`, solo
+  **factura y nota de crédito de factura** (decisión del equipo del
+  facturador, no técnica) — boleta, nota de débito y nota de crédito de
+  boleta quedan afuera, se les deja `pdf_bytes` sin tocar. En lotes de
+  `PDF_LOTE_CANTIDAD` (20 por defecto) ordenados por `id` — nunca el atraso
+  completo de una sola corrida. Sin filtro de receptor: `"0"` (consumidor
+  final) es un valor válido para `numeroDocumentoReceptor`, aunque en factura
+  es poco común.
+- **Confirmación**: recién subido con éxito a FuelHub core se ejecuta, en una
+  sola sentencia, `pdf_enviado=1, pdf_bytes=NULL WHERE id=? AND pdf_enviado=0`
+  — nunca se vacía antes de confirmar. El `AND pdf_enviado=0` hace la
+  operación idempotente: si otra corrida ya la cerró, esta no la cuenta de
+  nuevo ni falla.
+- **Sin red o FuelHub core/S3 caído**: no se toca la fila, se reintenta en el
+  próximo ciclo. Si una corrida entera no logra subir nada habiendo algo
+  pendiente, se aplica un backoff de CICLO ENTERO creciente
+  (`PDF_ESPERA_MAX_CICLO_MIN`, 30 min por defecto) — mismo patrón que
+  `ciclo_generacion.py` — en vez de insistir cada `INTERVALO_PDF_SEG` y llenar
+  el log. Una fila que falla sola no bloquea al resto del lote.
+- **Una sola instancia por estación**: lo garantiza PM2 (un solo proceso
+  `facturador`, un solo hilo PDF dentro de él) — no hace falta coordinación
+  explícita en el código.
 
 ## Requisitos
 

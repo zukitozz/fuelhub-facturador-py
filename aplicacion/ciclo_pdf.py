@@ -1,46 +1,55 @@
 """
-Caso de uso del hilo PDF: envía a FuelHub core el PDF de los comprobantes ya
-aceptados (Comprobantes.pdf_bytes, enviado=1) y que todavía no se subieron
-(pdf_enviado = 0 o NULL) — ver fuelhub-core: services/ingest-comprobante-pdf,
-que lo sube a S3 para que la página web de consulta lo sirva. No participa del
-flujo de facturación con SUNAT —es best-effort para esa consulta— así que una
-falla acá nunca detiene el ciclo ni se propaga fuera de él.
+Caso de uso del hilo PDF: envía a FuelHub core el PDF de factura y de nota de
+crédito de factura ya aceptadas (Comprobantes.pdf_bytes, enviado=1) y que
+todavía no se subieron (pdf_enviado = 0 o NULL) — ver fuelhub-core:
+services/ingest-comprobante-pdf, que lo sube a S3 para que la página web de
+consulta lo sirva. Boleta, nota de débito y nota de crédito de boleta quedan
+afuera a propósito (decisión del equipo del facturador, ver el filtro en
+fuelhub_core.bd._SQL_PENDIENTES_PDF) — este módulo nunca las ve. No participa
+del flujo de facturación con SUNAT —es best-effort para esa consulta— así que
+una falla acá nunca detiene el ciclo ni se propaga fuera de él.
 
-Junto con el PDF, sube el XML y (para factura/nota) el CDR:
+pdf_bytes es un BUZÓN TEMPORAL, no un archivo permanente: cada base de
+estación tiene un tope de 10 GB, así que Sofia lo llena y este ciclo lo sube y
+lo vacía (ver fuelhub_core.bd.marcar_pdf_enviado) — nunca antes de confirmar
+la subida. Se procesa en lotes chicos (PDF_LOTE_CANTIDAD, ver config.py) para
+no intentar de una sola vez un atraso grande.
+
+Junto con el PDF, sube el XML y el CDR:
   - El XML ya está guardado en Comprobantes.xml_envio desde que
     aplicacion/ciclo_generacion.py lo recibió de facturador-api (columna
-    `incluir=xml` del POST) — acá no se vuelve a pedir, para una boleta ya no
-    se podría: una vez que el resumen diario la consume, su propia consulta
-    (GET) empieza a devolver 404.
-  - El CDR, en cambio, se pide fresco acá con un GET, solo para factura/nota:
-    una boleta nunca tiene CDR propio (es el del resumen que la agrupa, y
-    asociarlo por boleta no está resuelto del lado de facturador-api) — ver
-    decisión explícita de dejarlas sin CDR en este envío.
+    `incluir=xml` del POST) — acá no se vuelve a pedir.
+  - El CDR se pide fresco acá con un GET: factura y nota de crédito siempre
+    tienen CDR propio (a diferencia de la boleta, que no llega a este ciclo).
 
-_SQL_PENDIENTES_PDF ya exige enviado=1, así que para una boleta esta fila solo
-aparece una vez que quedó firmada (su propio "generado" ya cuenta como cierre,
-ver ciclo_generacion.py) — no hace falta esperar a ningún resumen para subir
-su PDF+XML.
+Si una corrida entera no logra subir nada (sin internet, FuelHub core/S3
+caído), se aplica un backoff de CICLO ENTERO creciente
+(PDF_ESPERA_MAX_CICLO_MIN) en vez de reintentar cada INTERVALO_PDF_SEG como si
+nada pasara — mismo patrón que aplicacion/ciclo_generacion.py. Una fila que
+falla sola (ej. un PDF puntual que FuelHub core rechaza) no bloquea al resto
+del lote: se loguea y se sigue con la siguiente.
 
 Mismo patrón que ciclo_cierres.py: mismas credenciales OAuth2
 (FUELHUB_CORE_CLIENT_ID/SECRET), mismo chequeo de motor.
 """
 import logging
+import time
 
 import repositorio
-from config import DATABASE_URL, EMISOR_RUC_OVERRIDE, FUELHUB_CORE_CLIENT_ID, FUELHUB_CORE_CLIENT_SECRET
+from config import (
+    DATABASE_URL, EMISOR_RUC_OVERRIDE, FUELHUB_CORE_CLIENT_ID, FUELHUB_CORE_CLIENT_SECRET,
+    PDF_LOTE_CANTIDAD, PDF_ESPERA_MAX_CICLO_MIN,
+)
 from dominio.texto import _codigo
 from aplicacion.bd_app import conectar_bd
 from fuelhub_core.bd import codigo_estacion, pendientes_pdf, marcar_pdf_enviado
 from fuelhub_core.api import subir_pdf_comprobante
 from fuelhub_api.cliente import consultar_comprobante
+from estado import envio_pdf
 
 logger = logging.getLogger(__name__)
 
 _avisado_sin_credenciales = False
-
-# Tipo de boleta: nunca tiene CDR propio, no tiene sentido pedírselo a facturador-api.
-_TIPO_BOLETA = "03"
 
 
 def _obtener_cdr(ruc: str, tipo: str, numeracion: str) -> tuple[str | None, bool]:
@@ -83,8 +92,9 @@ def ciclo_pdf():
     try:
         conn = conectar_bd()
         codigo = codigo_estacion(conn)
-        subidos = 0
-        for fila in pendientes_pdf(conn):
+        pendientes = pendientes_pdf(conn, PDF_LOTE_CANTIDAD)
+        subidos = procesados = 0
+        for fila in pendientes:
             comprobante_id = fila["id"]
             numeracion = fila["numeracion_comprobante"]
             try:
@@ -92,34 +102,52 @@ def ciclo_pdf():
                 xml = fila["xml_envio"]
                 xml_bytes = xml.encode("utf-8") if xml else None
 
-                cdr_bytes = None
-                if tipo != _TIPO_BOLETA:
-                    cdr, agotado = _obtener_cdr(EMISOR_RUC_OVERRIDE, tipo, numeracion)
-                    if agotado:
-                        logger.warning(
-                            "%s-%s no existe en facturador-api (404 pidiendo su "
-                            "CDR); se da por no subible y se deja de reintentar.",
-                            tipo, numeracion,
-                        )
-                        marcar_pdf_enviado(conn, comprobante_id)
-                        continue
-                    if not cdr:
-                        # Todavía sin CDR: se reintenta en el próximo ciclo,
-                        # no se sube el PDF a medias.
-                        continue
-                    cdr_bytes = cdr.encode("utf-8")
+                cdr, agotado = _obtener_cdr(EMISOR_RUC_OVERRIDE, tipo, numeracion)
+                if agotado:
+                    logger.warning(
+                        "%s-%s no existe en facturador-api (404 pidiendo su "
+                        "CDR); se da por no subible y se deja de reintentar.",
+                        tipo, numeracion,
+                    )
+                    marcar_pdf_enviado(conn, comprobante_id)
+                    procesados += 1
+                    continue
+                if not cdr:
+                    # Todavía sin CDR: se reintenta en el próximo ciclo,
+                    # no se sube el PDF a medias.
+                    continue
+                cdr_bytes = cdr.encode("utf-8")
 
                 if subir_pdf_comprobante(
                     codigo, EMISOR_RUC_OVERRIDE, numeracion, bytes(fila["pdf_bytes"]),
                     fila["numero_documento_receptor"], fila["fecha_emision"],
                     xml_bytes, cdr_bytes,
                 ) is not None:
-                    marcar_pdf_enviado(conn, comprobante_id)
-                    subidos += 1
+                    # Si no afectó ninguna fila, otra corrida ya la había
+                    # cerrado (AND pdf_enviado=0 de marcar_pdf_enviado): no es
+                    # un error, solo no cuenta de nuevo.
+                    if marcar_pdf_enviado(conn, comprobante_id):
+                        subidos += 1
+                    procesados += 1
             except Exception:
                 logger.exception("Error subiendo a FuelHub core el PDF de %s", numeracion)
+
         if subidos:
             logger.info("%d PDF de comprobante(s) subido(s).", subidos)
+        if procesados:
+            envio_pdf.limpiar_fallos_ciclo()
+        elif pendientes:
+            # Había algo para subir y la corrida entera no pudo avanzar nada:
+            # backoff creciente, en vez de reintentar cada INTERVALO_PDF_SEG
+            # como si no hubiera pasado nada (sin internet, S3/FuelHub core
+            # caído).
+            fallos_ciclo = envio_pdf.contar_fallo_ciclo()
+            espera_min = min(2 ** (fallos_ciclo - 1), PDF_ESPERA_MAX_CICLO_MIN)
+            logger.warning(
+                "%d corrida(s) seguidas sin poder subir ningún PDF; se pausa "
+                "%d min antes del próximo intento.", fallos_ciclo, espera_min,
+            )
+            time.sleep(espera_min * 60)
     except Exception:
         logger.exception("Error en ciclo_pdf")
     finally:

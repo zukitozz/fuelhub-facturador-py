@@ -83,11 +83,16 @@ SELECT COUNT(*) AS pendientes
    AND uuid IS NULL
 """
 
+# Solo factura y nota de crédito DE una factura van a S3 — decisión explícita
+# del equipo del facturador, no un criterio técnico: boleta, nota de débito y
+# nota de crédito de BOLETA quedan afuera. "c.tipo_comprobante='07' AND
+# c.tipo_documento_afectado='01'" es lo que distingue una nota de crédito de
+# factura de una de boleta (tipo_documento_afectado guarda el tipo del
+# comprobante que la nota corrige, ver aplicacion/lecturas.py).
+#
 # pdf_bytes IS NOT NULL: la aplicación todavía no generó el PDF de muchos
 # comprobantes en cualquier momento dado, y eso no es un error que haya que
 # reportar acá —simplemente no hay nada que subir todavía.
-# numero_documento = '0' es el receptor "Clientes Varios" (boleta sin DNI/RUC
-# capturado, ver repositorio/sqlserver.py:receptor); esos PDF no se suben.
 # numeroDocumentoReceptor y fechaEmision son REQUERIDOS por FuelHub core desde
 # el nuevo contrato de PUT v1/comprobantes/{numeracion}/pdf (antes no se
 # mandaban) — por eso ahora también se excluyen los comprobantes sin
@@ -96,20 +101,28 @@ SELECT COUNT(*) AS pendientes
 # PARAMETROS_INVALIDOS garantizado. Quedan pendientes (pdf_enviado sigue en 0)
 # hasta que el dato se complete.
 # enviado=1: se espera a que facturador-api ya haya cerrado el comprobante
-# (para factura/nota, con su CDR disponible; para boleta, firmada) antes de
-# subir nada — ver aplicacion/ciclo_pdf.py.
+# (con su CDR disponible) antes de subir nada — ver aplicacion/ciclo_pdf.py.
+#
+# numero_documento_receptor NO se filtra por "<> '0'": ese criterio viene
+# copiado de _SQL_FACTURAS_SEMANA (el reporte antifraude, donde un cliente
+# anónimo no aporta nada), pero acá no aplica —subir_pdf_comprobante solo
+# exige que el campo no venga vacío, "0" (consumidor final) es un valor
+# válido, aunque en factura es raro. COALESCE cubre el caso sin fila en
+# Receptores (ReceptorId NULL) con el mismo valor por defecto.
+# TOP (?) para no intentar subir todo el atraso de una corrida: ver
+# PDF_LOTE_CANTIDAD en config.py.
 _SQL_PENDIENTES_PDF = """
-SELECT c.id, c.numeracion_comprobante, c.pdf_bytes, c.tipo_comprobante, c.xml_envio,
+SELECT TOP (?) c.id, c.numeracion_comprobante, c.pdf_bytes, c.tipo_comprobante, c.xml_envio,
        CONVERT(varchar, c.fecha_emision, 23) AS fecha_emision,
-       r.numero_documento                     AS numero_documento_receptor
+       COALESCE(r.numero_documento, '0')      AS numero_documento_receptor
   FROM Comprobantes c
   LEFT JOIN Receptores r ON r.id = c.ReceptorId
  WHERE c.pdf_bytes IS NOT NULL
    AND (c.pdf_enviado = 0 OR c.pdf_enviado IS NULL)
    AND c.enviado = 1
    AND c.fecha_emision IS NOT NULL
-   AND r.numero_documento IS NOT NULL
-   AND r.numero_documento <> '0'
+   AND (c.tipo_comprobante = '01'
+        OR (c.tipo_comprobante = '07' AND c.tipo_documento_afectado = '01'))
  ORDER BY c.id
 """
 
@@ -150,10 +163,12 @@ def _filas(conn, sql: str, params: tuple = ()) -> list:
         return [dict(zip(columnas, fila)) for fila in cur.fetchall()]
 
 
-def _escribir(conn, sql: str, params: tuple):
+def _escribir(conn, sql: str, params: tuple) -> int:
     with closing(conn.cursor()) as cur:
         cur.execute(sql, params)
+        filas = cur.rowcount
     conn.commit()
+    return filas
 
 
 def pendientes_cierreturnos(conn) -> list:
@@ -213,12 +228,27 @@ def marcar_enviado_cierredia(conn, cierredia_id):
     _escribir(conn, "UPDATE Cierredias SET enviado=1 WHERE id=?", (cierredia_id,))
 
 
-def pendientes_pdf(conn) -> list:
-    return _filas(conn, _SQL_PENDIENTES_PDF)
+def pendientes_pdf(conn, lote: int) -> list:
+    return _filas(conn, _SQL_PENDIENTES_PDF, (lote,))
 
 
-def marcar_pdf_enviado(conn, comprobante_id):
-    _escribir(conn, "UPDATE Comprobantes SET pdf_enviado=1 WHERE id=?", (comprobante_id,))
+def marcar_pdf_enviado(conn, comprobante_id) -> bool:
+    """
+    pdf_bytes es un buzón temporal, no un archivo permanente (la base de cada
+    estación tiene un tope de 10 GB) — recién confirmada la subida a S3 se
+    vacía, en la MISMA sentencia que marca pdf_enviado=1, para que un corte
+    justo entre ambos pasos nunca deje una fila con el PDF ya vaciado pero
+    sin marcar como enviada (perdido de verdad, sin forma de reconstruirlo).
+    `AND pdf_enviado=0` hace la operación idempotente: si otra corrida ya la
+    marcó, esta no pisa nada ni cuenta como error. Devuelve si esta llamada
+    fue la que efectivamente la cerró.
+    """
+    filas = _escribir(
+        conn,
+        "UPDATE Comprobantes SET pdf_enviado=1, pdf_bytes=NULL WHERE id=? AND pdf_enviado=0",
+        (comprobante_id,),
+    )
+    return filas > 0
 
 
 def facturas_semana(conn, desde_fecha: str, hasta_fecha: str) -> list:
