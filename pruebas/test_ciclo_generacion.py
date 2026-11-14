@@ -215,6 +215,29 @@ check(not CAP["guardado_error"], "un estado 'error' no se guarda como rechazo de
 check(not envio_api.bloqueado("F002-000010"), "no cuenta contra el presupuesto de rechazos")
 check("F002-000010" not in envio_api.en_vuelo(), "no queda 'en vuelo': la API lo reintenta sola")
 
+def _fallos_ciclo_actual():
+    import json as _json
+    try:
+        with open(envio_api._ENVIO_API_PATH, encoding="utf-8") as fh:
+            return _json.load(fh).get("fallos_ciclo_consecutivos", 0)
+    except FileNotFoundError:
+        return 0
+check(
+    _fallos_ciclo_actual() == 0,
+    "un 'error' no cuenta como falla de infraestructura del ciclo entero (la API sí respondió)",
+)
+
+# Caso real en producción: una boleta que la API nunca resuelve (más de 5
+# días, "use el resumen diario") queda sola en la cola ciclo tras ciclo y,
+# antes de este fix, disparaba el backoff de CICLO ENTERO (2 horas) por un
+# solo comprobante trabado, aunque el resto de la estación funcionara bien.
+for _ in range(5):
+    cg.ciclo_generacion()
+check(
+    _fallos_ciclo_actual() == 0,
+    f"un comprobante en 'error' repetido durante varios ciclos NO dispara el backoff de ciclo entero ({_fallos_ciclo_actual()})",
+)
+
 # --- caso 10: conciliación detecta un resumen rechazado -> reencola boletas -
 reset()
 marcados_false = []

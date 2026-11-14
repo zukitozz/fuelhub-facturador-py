@@ -109,7 +109,7 @@ ahí; se consulta aparte (ver `ciclo_pdf.py`). Ver
 | `enviado` / `validando` / `pendiente` | SUNAT ya la tiene, falta el CDR: guarda el XML si vino, no marca enviado, se reconsulta por `GET` en cada ciclo hasta tener veredicto |
 | `rechazado` / HTTP 422 | Guarda el motivo (`codigo_error`+`descripcion_error`) en `errors`; **no** reintenta solo más de `MAX_REINTENTOS_RECHAZO` veces |
 | `anulado` | Venció el plazo de 7 días sin que SUNAT lo recibiera: se trata igual que un rechazo (hace falta un número nuevo, nunca va a poder reenviarse con el mismo) |
-| `error` | Ambiguo por diseño: se deja tal cual, SIN backoff propio — la API ya reintenta sola (5 intentos cada 10 min, hasta 3 días) y verifica con SUNAT antes de reenviar |
+| `error` | Ambiguo por diseño: se deja tal cual, SIN backoff propio — la API ya reintenta sola (5 intentos cada 10 min, hasta 3 días) y verifica con SUNAT antes de reenviar. Tampoco cuenta para el backoff de ciclo entero: la API sí respondió, no es una falla de infraestructura del daemon |
 | HTTP 404 (RUC sin alta) | Error crítico: corta el ciclo entero |
 | HTTP 502 | La API ya verificó que no se envió nada: se reintenta en el próximo ciclo, sin backoff propio ni gastar presupuesto de rechazos |
 | Sin respuesta HTTP (timeout real) | Ambiguo de verdad: se resuelve con un `GET` antes de seguir — nunca se reenvía a ciegas |
