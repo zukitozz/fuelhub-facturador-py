@@ -150,6 +150,41 @@ Lo único que hace el daemon, una vez al día, es **conciliar**: `GET
   resumen rechazado ya reencoló, para no repetirlo cada vez que lo vuelva a ver
   en la lista.
 
+## Subida del PDF a FuelHub core
+
+`Comprobantes.pdf_bytes` es un **buzón temporal**, no un archivo permanente: la
+base de cada estación tiene un tope (SQL Express, 10 GB), así que la aplicación
+de origen lo llena y este daemon (`ciclo_pdf.py`) lo sube a S3 y lo vacía.
+
+| `pdf_bytes` | `pdf_enviado` | Significado |
+|---|---|---|
+| `NULL` | `0` | pendiente de generar, del lado de la aplicación de origen |
+| lleno | `0` | listo para subir |
+| `NULL` | `1` | subido y vaciado |
+
+- **Selección**: `enviado=1 AND pdf_enviado=0 AND pdf_bytes IS NOT NULL`, solo
+  **factura y nota de crédito de factura** (decisión del equipo del
+  facturador, no técnica) — boleta, nota de débito y nota de crédito de
+  boleta quedan afuera, se les deja `pdf_bytes` sin tocar. En lotes de
+  `PDF_LOTE_CANTIDAD` (20 por defecto) ordenados por `id` — nunca el atraso
+  completo de una sola corrida. Sin filtro de receptor: `"0"` (consumidor
+  final) es un valor válido para `numeroDocumentoReceptor`, aunque en factura
+  es poco común.
+- **Confirmación**: recién subido con éxito a FuelHub core se ejecuta, en una
+  sola sentencia, `pdf_enviado=1, pdf_bytes=NULL WHERE id=? AND pdf_enviado=0`
+  — nunca se vacía antes de confirmar. El `AND pdf_enviado=0` hace la
+  operación idempotente: si otra corrida ya la cerró, esta no la cuenta de
+  nuevo ni falla.
+- **Sin red o FuelHub core/S3 caído**: no se toca la fila, se reintenta en el
+  próximo ciclo. Si una corrida entera no logra subir nada habiendo algo
+  pendiente, se aplica un backoff de CICLO ENTERO creciente
+  (`PDF_ESPERA_MAX_CICLO_MIN`, 30 min por defecto) — mismo patrón que
+  `ciclo_generacion.py` — en vez de insistir cada `INTERVALO_PDF_SEG` y llenar
+  el log. Una fila que falla sola no bloquea al resto del lote.
+- **Una sola instancia por estación**: lo garantiza PM2 (un solo proceso
+  `facturador`, un solo hilo PDF dentro de él) — no hace falta coordinación
+  explícita en el código.
+
 ## Requisitos
 
 Python 3.10+, la base de la aplicación accesible (PostgreSQL o SQL Server), acceso

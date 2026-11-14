@@ -98,6 +98,10 @@ _ENVIO_API_PATH = os.path.join(_BASE, "envio_api.json")
 # disco por el mismo motivo: un reinicio de PM2 no puede perder de vista qué
 # clave ya se usó (ver aplicacion/ciclo_reporte_facturas.py).
 _REPORTE_FACTURAS_PATH = os.path.join(_BASE, "reporte_facturas.json")
+# Cuántas corridas seguidas del ciclo de PDF no pudieron subir nada (backoff
+# de ciclo entero, ver estado/envio_pdf.py y aplicacion/ciclo_pdf.py) — mismo
+# motivo que los anteriores: sobrevive a un reinicio de PM2.
+_ENVIO_PDF_PATH = os.path.join(_BASE, "envio_pdf.json")
 
 # Cuántos bloqueados se detallan en el log antes de resumir; son estables entre
 # ciclos y volcarlos todos cada 60s ahoga el resto del log.
@@ -180,6 +184,15 @@ FUELHUB_CORE_CLIENT_SECRET = os.getenv("FUELHUB_CORE_CLIENT_SECRET", "").strip()
 # en esta PC. Solo existe en instalaciones de grifo con SQL Server, igual que
 # Cierreturnos/Cierredias.
 INTERVALO_PDF_SEG = int(os.getenv("INTERVALO_PDF_SEG", "60"))
+# Cuántas filas se procesan por corrida: pdf_bytes es un buzón temporal (tope
+# de 10 GB por base), así que conviene vaciarlo en lotes chicos y frecuentes
+# en vez de intentar todo el atraso de una sola vez.
+PDF_LOTE_CANTIDAD = int(os.getenv("PDF_LOTE_CANTIDAD", "20"))
+# Techo del backoff cuando una corrida entera no pudo subir nada (sin
+# internet, S3/FuelHub core caído) — no tiene sentido reintentar cada
+# INTERVALO_PDF_SEG si el problema es de conectividad, y machacar el log con
+# el mismo error no ayuda a nadie.
+PDF_ESPERA_MAX_CICLO_MIN = int(os.getenv("PDF_ESPERA_MAX_CICLO_MIN", "30"))
 
 # Reporte semanal antifraude (POST v1/reportes/top-facturas): el top de clientes
 # que más facturaron en la semana ya cerrada (lunes a domingo) y qué despachador
